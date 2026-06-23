@@ -28,7 +28,19 @@ const fastify = Fastify({
 await fastify.register(sensible)
 
 await fastify.register(cors, {
-  origin: process.env.CORS_ORIGIN ?? 'http://localhost:5173',
+  origin: (origin, cb) => {
+    const allowed = [
+      'http://localhost:5173',
+      'http://localhost:4173',
+      process.env.CORS_ORIGIN,
+    ].filter(Boolean)
+
+    if (!origin || allowed.includes(origin) || origin.endsWith('.vercel.app')) {
+      cb(null, true)
+    } else {
+      cb(new Error('Not allowed by CORS'))
+    }
+  },
   credentials: true,
 })
 
