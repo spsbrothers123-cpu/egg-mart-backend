@@ -131,17 +131,18 @@ async function migrate() {
     )
   `
 
-  await sql`
-    CREATE TABLE IF NOT EXISTS sessions (
-      id              SERIAL PRIMARY KEY,
-      cashier_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      opening_cash    NUMERIC(10,2) NOT NULL DEFAULT 0,
-      closing_cash    NUMERIC(10,2),
-      status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
-      opened_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      closed_at       TIMESTAMPTZ
-    )
-  `
+ await sql`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id              SERIAL PRIMARY KEY,
+    cashier_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    opening_cash    NUMERIC(10,2) NOT NULL DEFAULT 0,
+    closing_cash    NUMERIC(10,2),
+    drawer_counts   JSONB,
+    status          TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+    opened_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    closed_at       TIMESTAMPTZ
+  )
+`
 
   await sql`
     CREATE TABLE IF NOT EXISTS activity_logs (
