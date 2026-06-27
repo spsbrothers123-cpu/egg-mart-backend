@@ -8,6 +8,7 @@
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
     "migrate": "node src/db/migrate.js",
+    "alter": "node src/db/alter.js",
     "seed": "node src/db/seed.js"
   },
   "dependencies": {
