@@ -57,6 +57,41 @@ async function alter() {
   await sql`CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase_id ON purchase_items(purchase_id)`
   console.log('✅ purchases indexes ready.')
 
+  // ── Daily invoice counters ────────────────────────────────────────────────
+  // Backs atomic, gap-free invoice number generation (YYYYMMDD-00001).
+  // A single UPSERT that increments this row is used *inside* the same
+  // transaction as the bill insert, so concurrent checkouts serialize on the
+  // row lock instead of racing on a COUNT(*) read (which produced duplicate
+  // invoice numbers and 500 errors under concurrent load).
+  await sql`
+    CREATE TABLE IF NOT EXISTS daily_invoice_counters (
+      invoice_date DATE PRIMARY KEY,
+      counter      INTEGER NOT NULL DEFAULT 0
+    )
+  `
+  console.log('✅ daily_invoice_counters table ready.')
+
+  // Backfill from any existing bills so the counter doesn't restart at 0
+  // and collide with already-issued invoice numbers on today's date.
+  await sql`
+    INSERT INTO daily_invoice_counters (invoice_date, counter)
+    SELECT created_at::date, COUNT(*)
+    FROM bills
+    GROUP BY created_at::date
+    ON CONFLICT (invoice_date) DO UPDATE SET counter = GREATEST(daily_invoice_counters.counter, EXCLUDED.counter)
+  `
+  console.log('✅ daily_invoice_counters backfilled.')
+
+  // ── Performance indexes required by the optimization pass ───────────────
+  await sql`CREATE INDEX IF NOT EXISTS idx_users_username        ON users(username)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_products_name         ON products(name)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_customers_phone       ON customers(phone)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_purchases_purchase_date ON purchases(purchase_date)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_sessions_opened_at    ON sessions(opened_at)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_bills_payment_status  ON bills(payment_status)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_activity_logs_created_at ON activity_logs(created_at)`
+  console.log('✅ additional performance indexes ready.')
+
   await sql.end()
 }
 

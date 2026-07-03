@@ -1,12 +1,18 @@
 import sql from '../config/db.js'
 import { authenticate, requireRole } from '../middleware/auth.js'
+import { logActivity } from '../utils/audit.js'
+import { cached, cacheInvalidate } from '../utils/cache.js'
 
 export default async function productRoutes(fastify) {
   // GET /api/products
+  // The unfiltered, active-only product list is the single most-hit read in
+  // the app (billing screen re-fetches it constantly), so it's cached for a
+  // short TTL and invalidated immediately on any product write.
   fastify.get('/', { preHandler: authenticate }, async (req) => {
     const { category, search, active = 'true' } = req.query
+    const cacheKey = `products:list:${active}:${category ?? ''}:${search ?? ''}`
 
-    let products = await sql`
+    return cached(cacheKey, 15_000, () => sql`
       SELECT p.*, c.name AS category_name, c.slug AS category_slug
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
@@ -16,8 +22,7 @@ export default async function productRoutes(fastify) {
              OR p.name ILIKE ${'%' + (search ?? '') + '%'}
              OR p.sku  ILIKE ${'%' + (search ?? '') + '%'})
       ORDER BY p.id
-    `
-    return products
+    `)
   })
 
   // GET /api/products/:id
@@ -33,20 +38,74 @@ export default async function productRoutes(fastify) {
   })
 
   // POST /api/products
-  fastify.post('/', { preHandler: requireRole('admin') }, async (req, reply) => {
+  fastify.post('/', {
+    preHandler: requireRole('admin'),
+    schema: {
+      body: {
+        type: 'object',
+        required: ['name', 'pack', 'price'],
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 200 },
+          pack: { type: 'string', minLength: 1, maxLength: 100 },
+          sku: { type: ['string', 'null'] },
+          barcode: { type: ['string', 'null'] },
+          category_id: { type: ['integer', 'null'] },
+          price: { type: 'number', minimum: 0 },
+          stock: { type: 'integer', minimum: 0 },
+          emoji: { type: ['string', 'null'] },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const { name, pack, sku, barcode, category_id, price, stock, emoji } = req.body
+
+    const [dup] = await sql`SELECT id FROM products WHERE LOWER(name) = LOWER(${name}) AND active = TRUE`
+    if (dup) return reply.code(409).send({ error: `A product named "${name}" already exists` })
 
     const [product] = await sql`
       INSERT INTO products (name, pack, sku, barcode, category_id, price, stock, emoji)
       VALUES (${name}, ${pack}, ${sku ?? null}, ${barcode ?? null}, ${category_id ?? null}, ${price}, ${stock ?? 0}, ${emoji ?? '🥚'})
       RETURNING *
     `
+
+    cacheInvalidate('products:')
+
+    await logActivity(sql, {
+      userId: req.user.id, action: 'product_created', entity: 'product',
+      entityId: product.id, meta: { name: product.name }, ip: req.ip,
+    })
+
     return reply.code(201).send(product)
   })
 
   // PUT /api/products/:id
-  fastify.put('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
+  fastify.put('/:id', {
+    preHandler: requireRole('admin'),
+    schema: {
+      body: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 200 },
+          pack: { type: 'string', minLength: 1, maxLength: 100 },
+          sku: { type: ['string', 'null'] },
+          barcode: { type: ['string', 'null'] },
+          category_id: { type: ['integer', 'null'] },
+          price: { type: 'number', minimum: 0 },
+          stock: { type: 'integer', minimum: 0 },
+          emoji: { type: ['string', 'null'] },
+          active: { type: 'boolean' },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const { name, pack, sku, barcode, category_id, price, stock, emoji, active } = req.body
+
+    if (name) {
+      const [dup] = await sql`
+        SELECT id FROM products WHERE LOWER(name) = LOWER(${name}) AND active = TRUE AND id != ${req.params.id}
+      `
+      if (dup) return reply.code(409).send({ error: `A product named "${name}" already exists` })
+    }
 
     const [product] = await sql`
       UPDATE products SET
@@ -64,17 +123,34 @@ export default async function productRoutes(fastify) {
       RETURNING *
     `
     if (!product) return reply.code(404).send({ error: 'Product not found' })
+
+    cacheInvalidate('products:')
+
+    await logActivity(sql, {
+      userId: req.user.id, action: 'product_updated', entity: 'product',
+      entityId: product.id, meta: { name: product.name }, ip: req.ip,
+    })
+
     return product
   })
 
   // DELETE /api/products/:id  (soft delete)
   fastify.delete('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
-    await sql`UPDATE products SET active = FALSE WHERE id = ${req.params.id}`
+    const [product] = await sql`UPDATE products SET active = FALSE WHERE id = ${req.params.id} RETURNING id, name`
+    if (!product) return reply.code(404).send({ error: 'Product not found' })
+
+    cacheInvalidate('products:')
+
+    await logActivity(sql, {
+      userId: req.user.id, action: 'product_deleted', entity: 'product',
+      entityId: product.id, meta: { name: product.name }, ip: req.ip,
+    })
+
     return reply.code(204).send()
   })
 
-  // GET /api/products/categories
+  // GET /api/products/categories/list
   fastify.get('/categories/list', { preHandler: authenticate }, async () => {
-    return sql`SELECT * FROM categories ORDER BY name`
+    return cached('categories:list', 60_000, () => sql`SELECT * FROM categories ORDER BY name`)
   })
 }

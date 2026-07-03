@@ -15,7 +15,23 @@ export default async function supplierRoutes(fastify) {
   })
 
   // POST /api/suppliers
-  fastify.post('/', { preHandler: requireRole('admin') }, async (req, reply) => {
+  fastify.post('/', {
+    preHandler: requireRole('admin'),
+    schema: {
+      body: {
+        type: 'object',
+        required: ['name'],
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 200 },
+          contact: { type: ['string', 'null'] },
+          phone: { type: ['string', 'null'] },
+          email: { type: ['string', 'null'] },
+          address: { type: ['string', 'null'] },
+          products: { type: ['string', 'null'] },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const { name, contact, phone, email, address, products } = req.body
     const [supplier] = await sql`
       INSERT INTO suppliers (name, contact, phone, email, address, products)
