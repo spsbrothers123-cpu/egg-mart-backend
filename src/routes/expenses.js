@@ -2,6 +2,13 @@ import sql from '../config/db.js'
 import { requireRole } from '../middleware/auth.js'
 import { logActivity } from '../utils/audit.js'
 
+// Whitelisted expense categories. Previously this field was free-text, so
+// "Transport" / "transport" / "Transportation" all showed up as separate
+// buckets in /reports/expenses, fragmenting the breakdown over time.
+export const EXPENSE_CATEGORIES = [
+  'Transport', 'Labour', 'Packaging', 'Utilities', 'Rent', 'Maintenance', 'Miscellaneous',
+]
+
 export default async function expenseRoutes(fastify) {
   // GET /api/expenses — paginated, filterable
   fastify.get('/', { preHandler: requireRole('admin') }, async (req) => {
@@ -39,7 +46,7 @@ export default async function expenseRoutes(fastify) {
         type: 'object',
         required: ['category', 'amount'],
         properties: {
-          category: { type: 'string', minLength: 1 },
+          category: { type: 'string', enum: EXPENSE_CATEGORIES },
           amount: { type: 'number', exclusiveMinimum: 0 },
           note: { type: ['string', 'null'] },
           expense_date: { type: ['string', 'null'] },
@@ -69,7 +76,7 @@ export default async function expenseRoutes(fastify) {
       body: {
         type: 'object',
         properties: {
-          category: { type: 'string', minLength: 1 },
+          category: { type: 'string', enum: EXPENSE_CATEGORIES },
           amount: { type: 'number', exclusiveMinimum: 0 },
           note: { type: ['string', 'null'] },
           expense_date: { type: ['string', 'null'] },

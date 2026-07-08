@@ -92,6 +92,57 @@ async function alter() {
   await sql`CREATE INDEX IF NOT EXISTS idx_activity_logs_created_at ON activity_logs(created_at)`
   console.log('✅ additional performance indexes ready.')
 
+  // ── Allow 'credit' as a valid payment_method ─────────────────────────────
+  // bills.js already accepts 'credit' in its request schema and updates
+  // customers.credit_used for it, but the original CHECK constraint never
+  // included it, so every credit sale hit an unhandled 500 from Postgres.
+  await sql`
+    ALTER TABLE bills
+    DROP CONSTRAINT IF EXISTS bills_payment_method_check
+  `
+  await sql`
+    ALTER TABLE bills
+    ADD CONSTRAINT bills_payment_method_check
+    CHECK (payment_method IN ('cash','card','upi','net_banking','split','credit'))
+  `
+  console.log("✅ bills.payment_method CHECK now allows 'credit'.")
+
+  // ── Enforce credit_used <= credit_limit at the DB level ──────────────────
+  // Nothing previously stopped credit_used from exceeding credit_limit.
+  // This is a safety net in addition to the app-layer check added in
+  // bills.js; if that check is ever bypassed, the DB itself now refuses.
+  await sql`
+    ALTER TABLE customers
+    DROP CONSTRAINT IF EXISTS customers_credit_used_within_limit
+  `
+  await sql`
+    ALTER TABLE customers
+    ADD CONSTRAINT customers_credit_used_within_limit
+    CHECK (credit_used <= credit_limit)
+  `
+  console.log('✅ customers.credit_used constrained to <= credit_limit.')
+
+  // ── Normalize pre-existing free-text expense categories ──────────────────
+  // Now that expenses.category is whitelisted going forward (see expenses.js),
+  // fold obvious casing/naming variants already in the table into the
+  // canonical set so historical reports aren't fragmented.
+  const categoryAliases = {
+    transport: 'Transport', transportation: 'Transport',
+    labour: 'Labour', labor: 'Labour',
+    packaging: 'Packaging',
+    utilities: 'Utilities', utility: 'Utilities',
+    rent: 'Rent',
+    maintenance: 'Maintenance', repair: 'Maintenance', repairs: 'Maintenance',
+    misc: 'Miscellaneous', miscellaneous: 'Miscellaneous', other: 'Miscellaneous',
+  }
+  for (const [alias, canonical] of Object.entries(categoryAliases)) {
+    await sql`
+      UPDATE expenses SET category = ${canonical}
+      WHERE LOWER(category) = ${alias} AND category != ${canonical}
+    `
+  }
+  console.log('✅ Existing expense categories normalized to whitelist.')
+
   await sql.end()
 }
 

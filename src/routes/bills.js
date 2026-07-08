@@ -79,6 +79,13 @@ export default async function billRoutes(fastify) {
   // POST /api/bills — create a new bill
   fastify.post('/', {
     preHandler: authenticate,
+    // Bill creation is the highest-frequency write in the app (every
+    // checkout). It previously shared the global 300/min pool with every
+    // other endpoint, so one busy terminal could throttle the rest of the
+    // instance. Give it its own generous, dedicated budget instead.
+    config: {
+      rateLimit: { max: 120, timeWindow: '1 minute' },
+    },
     schema: {
       body: {
         type: 'object',
@@ -170,9 +177,31 @@ export default async function billRoutes(fastify) {
           }
         }
 
-        if (payment_method === 'credit' && customer_id) {
+        if (payment_method === 'credit') {
+          if (!customer_id) {
+            throw fastify.httpErrors.badRequest('A customer must be selected for credit sales')
+          }
+
+          // Lock the customer row so concurrent credit sales for the same
+          // customer can't both read a stale credit_used and both pass the
+          // limit check (the classic check-then-act race).
+          const [customer] = await tx`
+            SELECT credit_limit, credit_used FROM customers WHERE id = ${customer_id} FOR UPDATE
+          `
+          if (!customer) {
+            throw fastify.httpErrors.badRequest('Customer not found')
+          }
+
+          const newCreditUsed = Number(customer.credit_used) + total
+          if (newCreditUsed > Number(customer.credit_limit)) {
+            const available = Number(customer.credit_limit) - Number(customer.credit_used)
+            throw fastify.httpErrors.badRequest(
+              `Credit limit exceeded: ₹${available.toFixed(2)} available, ₹${total.toFixed(2)} requested`
+            )
+          }
+
           await tx`
-            UPDATE customers SET credit_used = credit_used + ${total} WHERE id = ${customer_id}
+            UPDATE customers SET credit_used = ${newCreditUsed} WHERE id = ${customer_id}
           `
         }
 
@@ -180,6 +209,12 @@ export default async function billRoutes(fastify) {
       })
     } catch (err) {
       if (err.statusCode) throw err // validation error thrown above, already safe to surface
+      if (err.code === '23514') {
+        // Postgres check-violation (e.g. bills_payment_method_check or
+        // customers_credit_used_within_limit) slipping past the app-layer
+        // checks above — surface a real 400 instead of an opaque 500.
+        throw fastify.httpErrors.badRequest('This sale violates a data constraint (invalid payment method or credit limit exceeded)')
+      }
       throw err
     }
 

@@ -59,8 +59,17 @@ export default async function productRoutes(fastify) {
   }, async (req, reply) => {
     const { name, pack, sku, barcode, category_id, price, stock, emoji } = req.body
 
-    const [dup] = await sql`SELECT id FROM products WHERE LOWER(name) = LOWER(${name}) AND active = TRUE`
-    if (dup) return reply.code(409).send({ error: `A product named "${name}" already exists` })
+    // Check across active AND inactive (soft-deleted) rows — otherwise
+    // soft-deleting a product and recreating one with the same name leaves
+    // two rows sharing a name, which breaks anything joining by name instead
+    // of product_id.
+    const [dup] = await sql`SELECT id, active FROM products WHERE LOWER(name) = LOWER(${name})`
+    if (dup) {
+      const msg = dup.active
+        ? `A product named "${name}" already exists`
+        : `A product named "${name}" already exists (currently inactive/deleted) — reactivate it instead of creating a new one`
+      return reply.code(409).send({ error: msg })
+    }
 
     const [product] = await sql`
       INSERT INTO products (name, pack, sku, barcode, category_id, price, stock, emoji)
@@ -101,10 +110,16 @@ export default async function productRoutes(fastify) {
     const { name, pack, sku, barcode, category_id, price, stock, emoji, active } = req.body
 
     if (name) {
+      // Same active+inactive check as create — see comment above.
       const [dup] = await sql`
-        SELECT id FROM products WHERE LOWER(name) = LOWER(${name}) AND active = TRUE AND id != ${req.params.id}
+        SELECT id, active FROM products WHERE LOWER(name) = LOWER(${name}) AND id != ${req.params.id}
       `
-      if (dup) return reply.code(409).send({ error: `A product named "${name}" already exists` })
+      if (dup) {
+        const msg = dup.active
+          ? `A product named "${name}" already exists`
+          : `A product named "${name}" already exists (currently inactive/deleted) — reactivate it instead of renaming to it`
+        return reply.code(409).send({ error: msg })
+      }
     }
 
     const [product] = await sql`

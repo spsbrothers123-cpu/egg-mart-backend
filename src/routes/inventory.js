@@ -6,7 +6,7 @@ import { cacheInvalidate } from '../utils/cache.js'
 export default async function inventoryRoutes(fastify) {
   // GET /api/inventory  — current stock levels
   fastify.get('/', { preHandler: authenticate }, async (req) => {
-    const { search, limit = 100, offset = 0 } = req.query
+    const { search, category, limit = 100, offset = 0 } = req.query
     const safeLimit = Math.min(500, Math.max(1, parseInt(limit) || 100))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
 
@@ -17,6 +17,7 @@ export default async function inventoryRoutes(fastify) {
       LEFT JOIN categories c ON c.id = p.category_id
       WHERE p.active = TRUE
         AND (${search ?? null}::text IS NULL OR p.name ILIKE ${'%' + (search ?? '') + '%'})
+        AND (${category ?? null}::text IS NULL OR c.slug = ${category ?? null})
       ORDER BY p.stock ASC
       LIMIT ${safeLimit} OFFSET ${safeOffset}
     `
@@ -25,11 +26,14 @@ export default async function inventoryRoutes(fastify) {
   // GET /api/inventory/low-stock
   fastify.get('/low-stock', { preHandler: authenticate }, async (req) => {
     const threshold = Math.max(0, parseInt(req.query.threshold) || 50)
+    const { category, search } = req.query
     return sql`
       SELECT p.id, p.name, p.pack, p.stock, p.emoji, c.name AS category_name
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
       WHERE p.active = TRUE AND p.stock < ${threshold}
+        AND (${search ?? null}::text IS NULL OR p.name ILIKE ${'%' + (search ?? '') + '%'})
+        AND (${category ?? null}::text IS NULL OR c.slug = ${category ?? null})
       ORDER BY p.stock ASC
     `
   })

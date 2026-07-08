@@ -51,7 +51,7 @@ async function migrate() {
       email        TEXT,
       address      TEXT,
       credit_limit NUMERIC(10,2) NOT NULL DEFAULT 0,
-      credit_used  NUMERIC(10,2) NOT NULL DEFAULT 0,
+      credit_used  NUMERIC(10,2) NOT NULL DEFAULT 0 CHECK (credit_used <= credit_limit),
       active       BOOLEAN NOT NULL DEFAULT TRUE,
       created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -85,7 +85,7 @@ async function migrate() {
       tax_pct        NUMERIC(5,2) NOT NULL DEFAULT 0,
       tax_amt        NUMERIC(10,2) NOT NULL DEFAULT 0,
       total          NUMERIC(10,2) NOT NULL,
-      payment_method TEXT NOT NULL DEFAULT 'cash' CHECK (payment_method IN ('cash','card','upi','net_banking','split')),
+      payment_method TEXT NOT NULL DEFAULT 'cash' CHECK (payment_method IN ('cash','card','upi','net_banking','split','credit')),
       payment_status TEXT NOT NULL DEFAULT 'paid' CHECK (payment_status IN ('paid','credit','refunded','voided')),
       notes          TEXT,
       created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()

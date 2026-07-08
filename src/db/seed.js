@@ -15,6 +15,11 @@ async function seed() {
       ('Cashier One',   'cashier', ${cashierHash}, 'cashier')
     ON CONFLICT (username) DO NOTHING
   `
+  console.warn(
+    '⚠️  Seeded with default credentials (admin/admin123, cashier/1234). ' +
+    'These do NOT meet the app\'s own password policy and are for local/dev use only — ' +
+    'rotate both passwords before going to production.'
+  )
 
   // Categories — full set matching the frontend
   await sql`
