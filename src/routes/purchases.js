@@ -1,5 +1,5 @@
 import sql from '../config/db.js'
-import { authenticate, requireRole } from '../middleware/auth.js'
+import { requireRole } from '../middleware/auth.js'
 import { logActivity } from '../utils/audit.js'
 import { cacheInvalidate } from '../utils/cache.js'
 
@@ -8,7 +8,7 @@ export default async function purchaseRoutes(fastify) {
   // Returns a bare array (frontend does `Array.isArray(data) ? data : []`,
   // so wrapping this in { data, total } would silently empty the purchase
   // history UI). Total count is exposed via X-Total-Count instead.
-  fastify.get('/', { preHandler: authenticate }, async (req, reply) => {
+  fastify.get('/', { preHandler: requireRole('admin') }, async (req, reply) => {
     const { limit = 50, offset = 0, supplier, status } = req.query
     const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 50))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
@@ -38,7 +38,7 @@ export default async function purchaseRoutes(fastify) {
   })
 
   // GET /api/purchases/:id  (with line items)
-  fastify.get('/:id', { preHandler: authenticate }, async (req, reply) => {
+  fastify.get('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
     const [purchase] = await sql`
       SELECT p.*, u.name AS created_by_name
       FROM purchases p
@@ -53,7 +53,7 @@ export default async function purchaseRoutes(fastify) {
 
   // POST /api/purchases — create a new purchase and add stock
   fastify.post('/', {
-    preHandler: authenticate,
+    preHandler: requireRole('admin'),
     schema: {
       body: {
         type: 'object',
@@ -63,6 +63,7 @@ export default async function purchaseRoutes(fastify) {
           supplier: { type: ['string', 'null'] },
           purchase_date: { type: ['string', 'null'] },
           notes: { type: ['string', 'null'] },
+          gst_pct: { type: ['number', 'null'], minimum: 0, maximum: 100 },
           items: {
             type: 'array',
             minItems: 1,
@@ -82,17 +83,18 @@ export default async function purchaseRoutes(fastify) {
       },
     },
   }, async (req, reply) => {
-    const { invoice_no, supplier, purchase_date, items, notes } = req.body
+    const { invoice_no, supplier, purchase_date, items, notes, gst_pct = 0 } = req.body
 
     const subtotal = items.reduce((s, i) => s + Number(i.unit_price) * Number(i.qty), 0)
+    const gst_amt  = Math.round(subtotal * Number(gst_pct) / 100 * 100) / 100
 
     const purchase = await sql.begin(async tx => {
       const [p] = await tx`
-        INSERT INTO purchases (invoice_no, supplier, purchase_date, subtotal, notes, created_by)
+        INSERT INTO purchases (invoice_no, supplier, purchase_date, subtotal, gst_pct, gst_amt, notes, created_by)
         VALUES (
           ${invoice_no ?? null}, ${supplier ?? null},
           ${purchase_date ?? new Date().toISOString().slice(0, 10)},
-          ${subtotal}, ${notes ?? null}, ${req.user.id}
+          ${subtotal}, ${gst_pct}, ${gst_amt}, ${notes ?? null}, ${req.user.id}
         )
         RETURNING *
       `
