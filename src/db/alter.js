@@ -57,6 +57,14 @@ async function alter() {
   await sql`CREATE INDEX IF NOT EXISTS idx_purchase_items_purchase_id ON purchase_items(purchase_id)`
   console.log('✅ purchases indexes ready.')
 
+  // ── GST on purchases (needed by the admin Purchase History / Excel export) ──
+  await sql`
+    ALTER TABLE purchases
+    ADD COLUMN IF NOT EXISTS gst_pct NUMERIC(5,2) NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS gst_amt NUMERIC(10,2) NOT NULL DEFAULT 0
+  `
+  console.log('✅ purchases.gst_pct / gst_amt ready.')
+
   // ── Daily invoice counters ────────────────────────────────────────────────
   // Backs atomic, gap-free invoice number generation (YYYYMMDD-00001).
   // A single UPSERT that increments this row is used *inside* the same
