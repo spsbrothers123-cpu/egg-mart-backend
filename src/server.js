@@ -81,6 +81,15 @@ await fastify.register(cors, {
       cb(null, false)
     }
   },
+  // @fastify/cors defaults `methods` to 'GET,HEAD,POST' when not set explicitly.
+  // PUT/PATCH/DELETE are "non-simple" methods, so every cross-origin edit and
+  // delete request (product edit, product delete, etc.) fails at the
+  // preflight (OPTIONS) stage with "Method X is not allowed by
+  // Access-Control-Allow-Methods" — this is the actual root cause behind the
+  // intermittent "Failed to fetch" / blocked-DELETE errors seen from the
+  // deployed frontend, not a backend logic bug in the routes themselves.
+  methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 })
 
