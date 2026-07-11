@@ -151,6 +151,34 @@ async function alter() {
   }
   console.log('✅ Existing expense categories normalized to whitelist.')
 
+  // ── Clamp and lock down negative product stock ───────────────────────────
+  // The application layer (bills.js sale deduction, inventory.js /adjust)
+  // already prevents stock from going negative going forward via atomic
+  // row-locked UPDATE ... WHERE stock >= qty checks. But any product that
+  // went negative *before* those checks existed is still sitting in the
+  // table with a negative value, and nothing retroactively fixes it — it
+  // just sits there showing as "Critical" forever until someone notices.
+  // Clamp existing bad rows to 0, then add a CHECK constraint so it's
+  // impossible for any future code path (including ones we haven't audited)
+  // to write a negative value again.
+  const clamped = await sql`
+    UPDATE products SET stock = 0, updated_at = NOW()
+    WHERE stock < 0
+    RETURNING id, name
+  `
+  if (clamped.length) {
+    console.log(`⚠️  Clamped ${clamped.length} product(s) with negative stock to 0:`,
+      clamped.map(p => p.name).join(', '))
+  }
+
+  await sql`ALTER TABLE products DROP CONSTRAINT IF EXISTS products_stock_non_negative`
+  await sql`
+    ALTER TABLE products
+    ADD CONSTRAINT products_stock_non_negative
+    CHECK (stock >= 0)
+  `
+  console.log('✅ products.stock constrained to >= 0 at the database level.')
+
   await sql.end()
 }
 
