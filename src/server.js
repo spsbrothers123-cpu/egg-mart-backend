@@ -48,6 +48,19 @@ const fastify = Fastify({
       },
   trustProxy: true, // needed for correct req.ip behind a reverse proxy / load balancer
 })
+fastify.addContentTypeParser('application/json', { parseAs: 'string' }, function (req, body, done) {
+  if (body === '' || body == null) {
+    done(null, undefined)
+    return
+  }
+  try {
+    const json = JSON.parse(body)
+    done(null, json)
+  } catch (err) {
+    err.statusCode = 400
+    done(err, undefined)
+  }
+})
 
 // ── Plugins ──────────────────────────────────────────────────────────────────
 await fastify.register(sensible)
