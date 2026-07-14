@@ -134,14 +134,19 @@ export default async function billRoutes(fastify) {
       bill = await sql.begin(async tx => {
         const invoice_number = await generateInvoiceNumber(tx)
 
+        // Credit sales are unpaid at the moment of billing — they only become
+        // 'paid' once an admin settles them via PATCH /:id/settle-credit.
+        // Everything else is paid immediately at checkout, as before.
+        const payment_status = payment_method === 'credit' ? 'credit' : 'paid'
+
         const [b] = await tx`
           INSERT INTO bills
             (invoice_number, customer_id, cashier_id, subtotal, discount_pct, discount_amt,
-             tax_pct, tax_amt, total, payment_method, notes)
+             tax_pct, tax_amt, total, payment_method, payment_status, notes)
           VALUES
             (${invoice_number}, ${customer_id ?? null}, ${req.user.id},
              ${subtotal}, ${discount_pct}, ${discount_amt},
-             ${tax_pct}, ${tax_amt}, ${total}, ${payment_method}, ${notes ?? null})
+             ${tax_pct}, ${tax_amt}, ${total}, ${payment_method}, ${payment_status}, ${notes ?? null})
           RETURNING *
         `
 
@@ -233,12 +238,79 @@ export default async function billRoutes(fastify) {
     return reply.code(201).send(bill)
   })
 
+  // PATCH /api/bills/:id/settle-credit — admin-only "Mark as Paid" action.
+  // Settles an outstanding credit bill via Cash/UPI/Card, frees up the
+  // customer's credit limit, and records the settlement (method + who +
+  // when) on the bill itself so the original credit transaction and its
+  // settlement stay linked for audit purposes.
+  fastify.patch('/:id/settle-credit', {
+    preHandler: requireRole('admin'),
+    schema: {
+      body: {
+        type: 'object',
+        required: ['payment_method'],
+        properties: {
+          payment_method: { type: 'string', enum: ['cash', 'card', 'upi'] },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const { payment_method } = req.body
+
+    const bill = await sql.begin(async tx => {
+      const [existing] = await tx`SELECT * FROM bills WHERE id = ${req.params.id} FOR UPDATE`
+      if (!existing) return null
+      if (existing.payment_method !== 'credit') {
+        throw fastify.httpErrors.badRequest('This bill was not a credit sale')
+      }
+      if (existing.payment_status !== 'credit') {
+        throw fastify.httpErrors.badRequest('This credit bill is not pending (already settled or voided)')
+      }
+
+      const [settled] = await tx`
+        UPDATE bills SET
+          payment_status = 'paid',
+          settled_method = ${payment_method},
+          settled_at     = NOW(),
+          settled_by     = ${req.user.id}
+        WHERE id = ${req.params.id}
+        RETURNING *
+      `
+
+      if (settled.customer_id) {
+        await tx`
+          UPDATE customers
+          SET credit_used = GREATEST(0, credit_used - ${settled.total})
+          WHERE id = ${settled.customer_id}
+        `
+      }
+
+      return settled
+    })
+
+    if (!bill) return reply.code(404).send({ error: 'Bill not found' })
+
+    cacheInvalidate('dashboard:')
+
+    await logActivity(sql, {
+      userId: req.user.id,
+      action: 'credit_bill_settled',
+      entity: 'bill',
+      entityId: bill.id,
+      meta: { invoice_number: bill.invoice_number, total: bill.total, settled_method: payment_method },
+      ip: req.ip,
+    })
+
+    return bill
+  })
+
   // PATCH /api/bills/:id/void
   fastify.patch('/:id/void', { preHandler: requireRole('admin') }, async (req, reply) => {
     const bill = await sql.begin(async tx => {
       const [existing] = await tx`SELECT * FROM bills WHERE id = ${req.params.id}`
       if (!existing) return null
       if (existing.payment_status === 'voided') return existing // idempotent
+      const wasPendingCredit = existing.payment_method === 'credit' && existing.payment_status === 'credit'
 
       const [voided] = await tx`
         UPDATE bills SET payment_status = 'voided' WHERE id = ${req.params.id} RETURNING *
@@ -256,8 +328,11 @@ export default async function billRoutes(fastify) {
         `
       }
 
-      if (voided.payment_method === 'credit' && voided.customer_id) {
-        await tx`UPDATE customers SET credit_used = credit_used - ${voided.total} WHERE id = ${voided.customer_id}`
+      // Only release credit here if the bill was still outstanding — if it
+      // was already settled via settle-credit, credit_used was freed then,
+      // and subtracting again would incorrectly double-credit the customer.
+      if (wasPendingCredit && voided.customer_id) {
+        await tx`UPDATE customers SET credit_used = GREATEST(0, credit_used - ${voided.total}) WHERE id = ${voided.customer_id}`
       }
 
       return voided
