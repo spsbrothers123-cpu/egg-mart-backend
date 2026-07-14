@@ -280,7 +280,7 @@ export default async function billRoutes(fastify) {
       if (settled.customer_id) {
         await tx`
           UPDATE customers
-          SET credit_used = GREATEST(0, credit_used - ${settled.total})
+          SET credit_used = GREATEST(0, credit_used - ${Number(settled.total)})
           WHERE id = ${settled.customer_id}
         `
       }
@@ -332,7 +332,7 @@ export default async function billRoutes(fastify) {
       // was already settled via settle-credit, credit_used was freed then,
       // and subtracting again would incorrectly double-credit the customer.
       if (wasPendingCredit && voided.customer_id) {
-        await tx`UPDATE customers SET credit_used = GREATEST(0, credit_used - ${voided.total}) WHERE id = ${voided.customer_id}`
+        await tx`UPDATE customers SET credit_used = GREATEST(0, credit_used - ${Number(voided.total)}) WHERE id = ${voided.customer_id}`
       }
 
       return voided
