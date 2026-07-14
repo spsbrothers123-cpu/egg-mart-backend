@@ -179,6 +179,42 @@ async function alter() {
   `
   console.log('✅ products.stock constrained to >= 0 at the database level.')
 
+  // ── Credit bill settlement tracking ───────────────────────────────────────
+  // Credit sales are recorded with payment_method='credit' at checkout time.
+  // When an admin later settles one via "Mark as Paid" (Cash/UPI/Card), we
+  // need to remember which method actually settled the debt — separately
+  // from the original payment_method — so Sales History / Reports can show
+  // the true settlement method while still preserving the fact that the
+  // sale originated as a credit transaction (audit trail).
+  await sql`
+    ALTER TABLE bills
+    ADD COLUMN IF NOT EXISTS settled_method TEXT,
+    ADD COLUMN IF NOT EXISTS settled_at     TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS settled_by     INTEGER REFERENCES users(id) ON DELETE SET NULL
+  `
+  await sql`ALTER TABLE bills DROP CONSTRAINT IF EXISTS bills_settled_method_check`
+  await sql`
+    ALTER TABLE bills
+    ADD CONSTRAINT bills_settled_method_check
+    CHECK (settled_method IS NULL OR settled_method IN ('cash','card','upi'))
+  `
+  console.log('✅ bills.settled_method / settled_at / settled_by ready.')
+
+  // ── Backfill: credit bills created before payment_status was set correctly ──
+  // Earlier, POST /api/bills relied on the table default of payment_status =
+  // 'paid' regardless of payment_method, so any pre-existing credit sale is
+  // sitting there mislabeled as already paid. Bring those in line with the
+  // 'credit' (pending) status so they now correctly surface on the admin
+  // Credits page as outstanding.
+  await sql`
+    UPDATE bills SET payment_status = 'credit'
+    WHERE payment_method = 'credit' AND payment_status = 'paid' AND settled_at IS NULL
+  `
+  console.log('✅ Backfilled payment_status for pre-existing credit bills.')
+
+  await sql`CREATE INDEX IF NOT EXISTS idx_bills_payment_method ON bills(payment_method)`
+  console.log('✅ idx_bills_payment_method ready.')
+
   await sql.end()
 }
 
