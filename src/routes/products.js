@@ -2,21 +2,28 @@ import sql from '../config/db.js'
 import { authenticate, requireRole } from '../middleware/auth.js'
 import { logActivity } from '../utils/audit.js'
 import { cached, cacheInvalidate } from '../utils/cache.js'
+import { resolveShopScope, assertShopOwnedByAdmin, resolveAdminShopId } from '../utils/shop-scope.js'
 
 export default async function productRoutes(fastify) {
   // GET /api/products
   // The unfiltered, active-only product list is the single most-hit read in
   // the app (billing screen re-fetches it constantly), so it's cached for a
-  // short TTL and invalidated immediately on any product write.
+  // short TTL and invalidated immediately on any product write. The cache
+  // key includes the requester's shop scope — otherwise a cashier in Shop A
+  // could be served Shop B's cached product list.
   fastify.get('/', { preHandler: authenticate }, async (req) => {
     const { category, search, active = 'true' } = req.query
-    const cacheKey = `products:list:${active}:${category ?? ''}:${search ?? ''}`
+    const { shopIds } = await resolveShopScope(sql, req)
+    if (shopIds.length === 0) return []
+
+    const cacheKey = `products:list:${shopIds.join(',')}:${active}:${category ?? ''}:${search ?? ''}`
 
     return cached(cacheKey, 15_000, () => sql`
       SELECT p.*, c.name AS category_name, c.slug AS category_slug
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.active = ${active === 'true'}
+      WHERE p.shop_id = ANY(${shopIds})
+        AND p.active = ${active === 'true'}
         AND (${category ?? null}::text IS NULL OR c.slug = ${category ?? null})
         AND (${search ?? null}::text IS NULL
              OR p.name ILIKE ${'%' + (search ?? '') + '%'}
@@ -27,11 +34,12 @@ export default async function productRoutes(fastify) {
 
   // GET /api/products/:id
   fastify.get('/:id', { preHandler: authenticate }, async (req, reply) => {
+    const { shopIds } = await resolveShopScope(sql, req)
     const [product] = await sql`
       SELECT p.*, c.name AS category_name, c.slug AS category_slug
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.id = ${req.params.id}
+      WHERE p.id = ${req.params.id} AND p.shop_id = ANY(${shopIds})
     `
     if (!product) return reply.code(404).send({ error: 'Product not found' })
     return product
@@ -53,27 +61,30 @@ export default async function productRoutes(fastify) {
           price: { type: 'number', minimum: 0 },
           stock: { type: 'integer', minimum: 0 },
           emoji: { type: ['string', 'null'] },
+          shop_id: { type: ['integer', 'null'] },
         },
       },
     },
   }, async (req, reply) => {
     const { name, pack, sku, barcode, category_id, price, stock, emoji } = req.body
+    // The frontend doesn't have a shop-picker yet, so shop_id is optional
+    // here: it defaults to the admin's sole shop when they only have one,
+    // and only demands an explicit shop_id once they own more than one.
+    const shop_id = await resolveAdminShopId(fastify, sql, req.user.id, req.body.shop_id)
 
-    // Check across active AND inactive (soft-deleted) rows — otherwise
-    // soft-deleting a product and recreating one with the same name leaves
-    // two rows sharing a name, which breaks anything joining by name instead
-    // of product_id.
-    const [dup] = await sql`SELECT id, active FROM products WHERE LOWER(name) = LOWER(${name})`
+    // Check across active AND inactive (soft-deleted) rows, scoped to this
+    // shop only — the same product name is fine in two different shops.
+    const [dup] = await sql`SELECT id, active FROM products WHERE LOWER(name) = LOWER(${name}) AND shop_id = ${shop_id}`
     if (dup) {
       const msg = dup.active
-        ? `A product named "${name}" already exists`
-        : `A product named "${name}" already exists (currently inactive/deleted) — reactivate it instead of creating a new one`
+        ? `A product named "${name}" already exists in this shop`
+        : `A product named "${name}" already exists in this shop (currently inactive/deleted) — reactivate it instead of creating a new one`
       return reply.code(409).send({ error: msg })
     }
 
     const [product] = await sql`
-      INSERT INTO products (name, pack, sku, barcode, category_id, price, stock, emoji)
-      VALUES (${name}, ${pack}, ${sku ?? null}, ${barcode ?? null}, ${category_id ?? null}, ${price}, ${stock ?? 0}, ${emoji ?? '🥚'})
+      INSERT INTO products (name, pack, sku, barcode, category_id, price, stock, emoji, shop_id)
+      VALUES (${name}, ${pack}, ${sku ?? null}, ${barcode ?? null}, ${category_id ?? null}, ${price}, ${stock ?? 0}, ${emoji ?? '🥚'}, ${shop_id})
       RETURNING *
     `
 
@@ -81,7 +92,7 @@ export default async function productRoutes(fastify) {
 
     await logActivity(sql, {
       userId: req.user.id, action: 'product_created', entity: 'product',
-      entityId: product.id, meta: { name: product.name }, ip: req.ip,
+      entityId: product.id, meta: { name: product.name, shop_id }, ip: req.ip,
     })
 
     return reply.code(201).send(product)
@@ -109,15 +120,19 @@ export default async function productRoutes(fastify) {
   }, async (req, reply) => {
     const { name, pack, sku, barcode, category_id, price, stock, emoji, active } = req.body
 
+    const [existing] = await sql`SELECT shop_id FROM products WHERE id = ${req.params.id}`
+    if (!existing) return reply.code(404).send({ error: 'Product not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, existing.shop_id)
+
     if (name) {
-      // Same active+inactive check as create — see comment above.
+      // Same active+inactive check as create, scoped to this shop.
       const [dup] = await sql`
-        SELECT id, active FROM products WHERE LOWER(name) = LOWER(${name}) AND id != ${req.params.id}
+        SELECT id, active FROM products WHERE LOWER(name) = LOWER(${name}) AND shop_id = ${existing.shop_id} AND id != ${req.params.id}
       `
       if (dup) {
         const msg = dup.active
-          ? `A product named "${name}" already exists`
-          : `A product named "${name}" already exists (currently inactive/deleted) — reactivate it instead of renaming to it`
+          ? `A product named "${name}" already exists in this shop`
+          : `A product named "${name}" already exists in this shop (currently inactive/deleted) — reactivate it instead of renaming to it`
         return reply.code(409).send({ error: msg })
       }
     }
@@ -137,7 +152,6 @@ export default async function productRoutes(fastify) {
       WHERE id = ${req.params.id}
       RETURNING *
     `
-    if (!product) return reply.code(404).send({ error: 'Product not found' })
 
     cacheInvalidate('products:')
 
@@ -151,8 +165,11 @@ export default async function productRoutes(fastify) {
 
   // DELETE /api/products/:id  (soft delete)
   fastify.delete('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
+    const [existing] = await sql`SELECT shop_id FROM products WHERE id = ${req.params.id}`
+    if (!existing) return reply.code(404).send({ error: 'Product not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, existing.shop_id)
+
     const [product] = await sql`UPDATE products SET active = FALSE WHERE id = ${req.params.id} RETURNING id, name`
-    if (!product) return reply.code(404).send({ error: 'Product not found' })
 
     cacheInvalidate('products:')
 
@@ -164,7 +181,8 @@ export default async function productRoutes(fastify) {
     return reply.code(204).send()
   })
 
-  // GET /api/products/categories/list
+  // GET /api/products/categories/list — categories are a shared, unscoped
+  // taxonomy (not per-shop data), so no shop filtering applies here.
   fastify.get('/categories/list', { preHandler: authenticate }, async () => {
     return cached('categories:list', 60_000, () => sql`SELECT * FROM categories ORDER BY name`)
   })

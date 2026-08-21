@@ -1,17 +1,20 @@
 import sql from '../config/db.js'
 import { authenticate, requireRole } from '../middleware/auth.js'
+import { resolveShopScope, assertShopOwnedByAdmin, requireCashierShop, resolveAdminShopId } from '../utils/shop-scope.js'
 
 export default async function customerRoutes(fastify) {
-  // GET /api/customers — paginated, searchable
+  // GET /api/customers — paginated, searchable, shop-scoped
   fastify.get('/', { preHandler: authenticate }, async (req) => {
     const { search, limit = 50, offset = 0 } = req.query
     const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 50))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
+    const { shopIds } = await resolveShopScope(sql, req)
+    if (shopIds.length === 0) return { data: [], total: 0, limit: safeLimit, offset: safeOffset }
 
     const [rows, [{ total }]] = await Promise.all([
       sql`
         SELECT * FROM customers
-        WHERE active = TRUE
+        WHERE active = TRUE AND shop_id = ANY(${shopIds})
           AND (${search ?? null}::text IS NULL
                OR name  ILIKE ${'%' + (search ?? '') + '%'}
                OR phone ILIKE ${'%' + (search ?? '') + '%'})
@@ -20,7 +23,7 @@ export default async function customerRoutes(fastify) {
       `,
       sql`
         SELECT COUNT(*)::int AS total FROM customers
-        WHERE active = TRUE
+        WHERE active = TRUE AND shop_id = ANY(${shopIds})
           AND (${search ?? null}::text IS NULL
                OR name  ILIKE ${'%' + (search ?? '') + '%'}
                OR phone ILIKE ${'%' + (search ?? '') + '%'})
@@ -32,7 +35,8 @@ export default async function customerRoutes(fastify) {
 
   // GET /api/customers/:id
   fastify.get('/:id', { preHandler: authenticate }, async (req, reply) => {
-    const [customer] = await sql`SELECT * FROM customers WHERE id = ${req.params.id}`
+    const { shopIds } = await resolveShopScope(sql, req)
+    const [customer] = await sql`SELECT * FROM customers WHERE id = ${req.params.id} AND shop_id = ANY(${shopIds})`
     if (!customer) return reply.code(404).send({ error: 'Customer not found' })
 
     const bills = await sql`
@@ -55,14 +59,27 @@ export default async function customerRoutes(fastify) {
           email: { type: ['string', 'null'] },
           address: { type: ['string', 'null'] },
           credit_limit: { type: 'number', minimum: 0 },
+          shop_id: { type: ['integer', 'null'] }, // admins only; cashiers always use their own shop
         },
       },
     },
   }, async (req, reply) => {
     const { name, phone, email, address, credit_limit = 0 } = req.body
+
+    let shop_id
+    if (req.user.role === 'cashier') {
+      requireCashierShop(fastify, req)
+      shop_id = req.user.shop_id
+    } else {
+      // Admin path: shop_id is optional (see resolveAdminShopId) — the
+      // frontend doesn't have a shop-picker yet, so this defaults to the
+      // admin's sole shop when they only have one.
+      shop_id = await resolveAdminShopId(fastify, sql, req.user.id, req.body.shop_id)
+    }
+
     const [customer] = await sql`
-      INSERT INTO customers (name, phone, email, address, credit_limit)
-      VALUES (${name}, ${phone ?? null}, ${email ?? null}, ${address ?? null}, ${credit_limit})
+      INSERT INTO customers (name, phone, email, address, credit_limit, shop_id)
+      VALUES (${name}, ${phone ?? null}, ${email ?? null}, ${address ?? null}, ${credit_limit}, ${shop_id})
       RETURNING *
     `
     return reply.code(201).send(customer)
@@ -85,6 +102,8 @@ export default async function customerRoutes(fastify) {
     },
   }, async (req, reply) => {
     const { name, phone, email, address, credit_limit } = req.body
+    const { shopIds } = await resolveShopScope(sql, req)
+
     const [customer] = await sql`
       UPDATE customers SET
         name         = COALESCE(${name         ?? null}, name),
@@ -93,7 +112,7 @@ export default async function customerRoutes(fastify) {
         address      = COALESCE(${address      ?? null}, address),
         credit_limit = COALESCE(${credit_limit ?? null}::numeric, credit_limit),
         updated_at   = NOW()
-      WHERE id = ${req.params.id}
+      WHERE id = ${req.params.id} AND shop_id = ANY(${shopIds})
       RETURNING *
     `
     if (!customer) return reply.code(404).send({ error: 'Customer not found' })
@@ -102,7 +121,9 @@ export default async function customerRoutes(fastify) {
 
   // DELETE /api/customers/:id (soft)
   fastify.delete('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
-    await sql`UPDATE customers SET active = FALSE WHERE id = ${req.params.id}`
+    const { shopIds } = await resolveShopScope(sql, req)
+    const [customer] = await sql`UPDATE customers SET active = FALSE WHERE id = ${req.params.id} AND shop_id = ANY(${shopIds}) RETURNING id`
+    if (!customer) return reply.code(404).send({ error: 'Customer not found' })
     return reply.code(204).send()
   })
 }

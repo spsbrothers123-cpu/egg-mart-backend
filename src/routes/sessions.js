@@ -1,24 +1,31 @@
 import sql from '../config/db.js'
 import { authenticate, requireRole } from '../middleware/auth.js'
+import { getOwnedShopIds, requireCashierShop } from '../utils/shop-scope.js'
 
 export default async function sessionRoutes(fastify) {
-  // GET /api/sessions — list all sessions with revenue (admin only)
+  // GET /api/sessions — list sessions across the admin's own shops only.
   fastify.get('/', { preHandler: requireRole('admin') }, async (req) => {
+    const shopIds = await getOwnedShopIds(sql, req.user.id)
+    if (shopIds.length === 0) return []
+
     const sessions = await sql`
       SELECT
         s.*,
         u.name AS cashier_name,
+        sh.location AS shop_location,
         COUNT(b.id)::int                        AS bill_count,
         COALESCE(SUM(b.total), 0)::numeric      AS total_revenue,
         EXTRACT(EPOCH FROM (COALESCE(s.closed_at, NOW()) - s.opened_at))::int AS duration_seconds
       FROM sessions s
       LEFT JOIN users u ON u.id = s.cashier_id
+      LEFT JOIN shops sh ON sh.id = s.shop_id
       LEFT JOIN bills b
         ON b.cashier_id = s.cashier_id
         AND b.created_at >= s.opened_at
         AND b.created_at <= COALESCE(s.closed_at, NOW())
         AND b.payment_status != 'voided'
-      GROUP BY s.id, u.name
+      WHERE s.shop_id = ANY(${shopIds})
+      GROUP BY s.id, u.name, sh.location
       ORDER BY s.opened_at DESC
     `
     return sessions
@@ -70,6 +77,7 @@ export default async function sessionRoutes(fastify) {
 
   // POST /api/sessions/open
   fastify.post('/open', { preHandler: authenticate }, async (req, reply) => {
+    requireCashierShop(fastify, req)
     const { opening_cash = 0, drawer_counts = null } = req.body
 
     const [existing] = await sql`
@@ -78,9 +86,10 @@ export default async function sessionRoutes(fastify) {
     if (existing) return reply.code(400).send({ error: 'Session already open' })
 
     const [session] = await sql`
-      INSERT INTO sessions (cashier_id, opening_cash, drawer_counts)
+      INSERT INTO sessions (cashier_id, shop_id, opening_cash, drawer_counts)
       VALUES (
         ${req.user.id},
+        ${req.user.shop_id ?? null},
         ${opening_cash},
         ${drawer_counts ? JSON.stringify(drawer_counts) : null}
       )

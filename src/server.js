@@ -19,6 +19,7 @@ import userRoutes      from './routes/users.js'
 import sessionRoutes   from './routes/sessions.js'
 import dashboardRoutes from './routes/dashboard.js'
 import purchaseRoutes  from './routes/purchases.js'
+import shopRoutes      from './routes/shops.js'
 
 // ── Fail fast on missing required secrets ───────────────────────────────────
 // A fallback JWT secret is a critical vulnerability: it lets anyone who reads
@@ -137,6 +138,7 @@ await fastify.register(userRoutes,      { prefix: '/api/users'     })
 await fastify.register(sessionRoutes,   { prefix: '/api/sessions'  })
 await fastify.register(dashboardRoutes, { prefix: '/api/dashboard' })
 await fastify.register(purchaseRoutes,  { prefix: '/api/purchases' })
+await fastify.register(shopRoutes,      { prefix: '/api/shops'     })
 
 // ── Global error handler ─────────────────────────────────────────────────────
 fastify.setErrorHandler((error, request, reply) => {

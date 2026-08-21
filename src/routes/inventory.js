@@ -2,20 +2,23 @@ import sql from '../config/db.js'
 import { authenticate, requireRole } from '../middleware/auth.js'
 import { logActivity } from '../utils/audit.js'
 import { cacheInvalidate } from '../utils/cache.js'
+import { resolveShopScope, assertShopOwnedByAdmin } from '../utils/shop-scope.js'
 
 export default async function inventoryRoutes(fastify) {
-  // GET /api/inventory  — current stock levels
+  // GET /api/inventory  — current stock levels, shop-scoped
   fastify.get('/', { preHandler: authenticate }, async (req) => {
     const { search, category, limit = 100, offset = 0 } = req.query
     const safeLimit = Math.min(500, Math.max(1, parseInt(limit) || 100))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
+    const { shopIds } = await resolveShopScope(sql, req)
+    if (shopIds.length === 0) return []
 
     return sql`
       SELECT p.id, p.name, p.pack, p.sku, p.stock, p.emoji,
              c.name AS category_name
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.active = TRUE
+      WHERE p.active = TRUE AND p.shop_id = ANY(${shopIds})
         AND (${search ?? null}::text IS NULL OR p.name ILIKE ${'%' + (search ?? '') + '%'})
         AND (${category ?? null}::text IS NULL OR c.slug = ${category ?? null})
       ORDER BY p.stock ASC
@@ -27,11 +30,14 @@ export default async function inventoryRoutes(fastify) {
   fastify.get('/low-stock', { preHandler: authenticate }, async (req) => {
     const threshold = Math.max(0, parseInt(req.query.threshold) || 50)
     const { category, search } = req.query
+    const { shopIds } = await resolveShopScope(sql, req)
+    if (shopIds.length === 0) return []
+
     return sql`
       SELECT p.id, p.name, p.pack, p.stock, p.emoji, c.name AS category_name
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.active = TRUE AND p.stock < ${threshold}
+      WHERE p.active = TRUE AND p.shop_id = ANY(${shopIds}) AND p.stock < ${threshold}
         AND (${search ?? null}::text IS NULL OR p.name ILIKE ${'%' + (search ?? '') + '%'})
         AND (${category ?? null}::text IS NULL OR c.slug = ${category ?? null})
       ORDER BY p.stock ASC
@@ -56,6 +62,10 @@ export default async function inventoryRoutes(fastify) {
   }, async (req, reply) => {
     const { product_id, type, qty, note } = req.body
     const delta = type === 'out' ? -Math.abs(qty) : Math.abs(qty)
+
+    const [productShop] = await sql`SELECT shop_id FROM products WHERE id = ${product_id}`
+    if (!productShop) return reply.code(404).send({ error: 'Product not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, productShop.shop_id)
 
     const product = await sql.begin(async tx => {
       // Row-locked, atomic check-and-update: prevents stock from ever going
@@ -96,10 +106,14 @@ export default async function inventoryRoutes(fastify) {
   })
 
   // GET /api/inventory/:product_id/history
-  fastify.get('/:product_id/history', { preHandler: requireRole('admin') }, async (req) => {
+  fastify.get('/:product_id/history', { preHandler: requireRole('admin') }, async (req, reply) => {
     const { limit = 50, offset = 0 } = req.query
     const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 50))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
+
+    const [productShop] = await sql`SELECT shop_id FROM products WHERE id = ${req.params.product_id}`
+    if (!productShop) return reply.code(404).send({ error: 'Product not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, productShop.shop_id)
 
     return sql`
       SELECT sm.*, u.name AS created_by_name

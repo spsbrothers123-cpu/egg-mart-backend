@@ -9,11 +9,27 @@ async function seed() {
   const adminHash   = await bcrypt.hash('admin123', 10)
   const cashierHash = await bcrypt.hash('1234', 10)
 
-  await sql`
+  const [admin] = await sql`
     INSERT INTO users (name, username, password, role) VALUES
-      ('Admin',         'admin',   ${adminHash},   'admin'),
-      ('Cashier One',   'cashier', ${cashierHash}, 'cashier')
-    ON CONFLICT (username) DO NOTHING
+      ('Admin', 'admin', ${adminHash}, 'admin')
+    ON CONFLICT (username) DO UPDATE SET name = EXCLUDED.name
+    RETURNING id
+  `
+
+  // Main Shop, owned by the seeded admin — the seeded cashier is assigned
+  // to it so the multi-shop model has at least one real shop to work with.
+  const [shop] = await sql`
+    INSERT INTO shops (admin_id, name, location)
+    SELECT ${admin.id}, 'Main Shop', 'Main'
+    WHERE NOT EXISTS (SELECT 1 FROM shops WHERE admin_id = ${admin.id})
+    RETURNING id
+  `
+  const shopId = shop?.id ?? (await sql`SELECT id FROM shops WHERE admin_id = ${admin.id} ORDER BY id LIMIT 1`)[0].id
+
+  await sql`
+    INSERT INTO users (name, username, password, role, shop_id) VALUES
+      ('Cashier One', 'cashier', ${cashierHash}, 'cashier', ${shopId})
+    ON CONFLICT (username) DO UPDATE SET shop_id = EXCLUDED.shop_id
   `
   console.warn(
     '⚠️  Seeded with default credentials (admin/admin123, cashier/1234). ' +
@@ -83,8 +99,8 @@ async function seed() {
     const catId = catMap[p.category]
     if (!catId) { console.warn(`⚠️  No category for ${p.name} (${p.category})`); continue }
     await sql`
-      INSERT INTO products (name, pack, sku, price, stock, category_id, emoji)
-      VALUES (${p.name}, ${p.pack}, ${p.sku}, ${p.price}, ${p.stock}, ${catId}, ${p.emoji})
+      INSERT INTO products (name, pack, sku, price, stock, category_id, emoji, shop_id)
+      VALUES (${p.name}, ${p.pack}, ${p.sku}, ${p.price}, ${p.stock}, ${catId}, ${p.emoji}, ${shopId})
       ON CONFLICT (sku) DO UPDATE SET
         name = EXCLUDED.name,
         pack = EXCLUDED.pack,
@@ -96,30 +112,30 @@ async function seed() {
 
   // Customers
   await sql`
-    INSERT INTO customers (name, phone, credit_limit) VALUES
-      ('Walk-in Customer', NULL,          0),
-      ('Ravi Kumar',       '9876543210',  1000),
-      ('Meena Devi',       '9123456789',  500),
-      ('Suresh Raj',       '9988776655',  1500)
+    INSERT INTO customers (name, phone, credit_limit, shop_id) VALUES
+      ('Walk-in Customer', NULL,          0,    ${shopId}),
+      ('Ravi Kumar',       '9876543210',  1000, ${shopId}),
+      ('Meena Devi',       '9123456789',  500,  ${shopId}),
+      ('Suresh Raj',       '9988776655',  1500, ${shopId})
     ON CONFLICT DO NOTHING
   `
 
   // Suppliers
   await sql`
-    INSERT INTO suppliers (name, contact, phone, products) VALUES
-      ('Fresh Farm Co.',   'Rajesh K.', '9876541234', 'White & Brown Eggs'),
-      ('Desi Egg Traders', 'Anand M.',  '9123457890', 'Desi Eggs'),
-      ('Aqua Duck Farm',   'Priya S.',  '9988771234', 'Duck & Quail Eggs')
+    INSERT INTO suppliers (name, contact, phone, products, shop_id) VALUES
+      ('Fresh Farm Co.',   'Rajesh K.', '9876541234', 'White & Brown Eggs', ${shopId}),
+      ('Desi Egg Traders', 'Anand M.',  '9123457890', 'Desi Eggs',          ${shopId}),
+      ('Aqua Duck Farm',   'Priya S.',  '9988771234', 'Duck & Quail Eggs',  ${shopId})
     ON CONFLICT DO NOTHING
   `
 
   // Sample expenses
   await sql`
-    INSERT INTO expenses (category, amount, note, expense_date) VALUES
-      ('Transport',  450,  'Delivery van fuel',  CURRENT_DATE),
-      ('Labour',     600,  'Helper wages',        CURRENT_DATE - 1),
-      ('Packaging',  300,  'Egg cartons',         CURRENT_DATE - 2),
-      ('Utilities', 1200,  'Electricity bill',    CURRENT_DATE - 3)
+    INSERT INTO expenses (category, amount, note, expense_date, shop_id) VALUES
+      ('Transport',  450,  'Delivery van fuel',  CURRENT_DATE,     ${shopId}),
+      ('Labour',     600,  'Helper wages',        CURRENT_DATE - 1, ${shopId}),
+      ('Packaging',  300,  'Egg cartons',         CURRENT_DATE - 2, ${shopId}),
+      ('Utilities', 1200,  'Electricity bill',    CURRENT_DATE - 3, ${shopId})
     ON CONFLICT DO NOTHING
   `
 

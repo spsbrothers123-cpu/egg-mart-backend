@@ -2,9 +2,10 @@ import sql from '../config/db.js'
 import { requireRole } from '../middleware/auth.js'
 import { logActivity } from '../utils/audit.js'
 import { cacheInvalidate } from '../utils/cache.js'
+import { getOwnedShopIds, assertShopOwnedByAdmin } from '../utils/shop-scope.js'
 
 export default async function purchaseRoutes(fastify) {
-  // GET /api/purchases — paginated list, newest first.
+  // GET /api/purchases — paginated list, newest first, shop-scoped.
   // Returns a bare array (frontend does `Array.isArray(data) ? data : []`,
   // so wrapping this in { data, total } would silently empty the purchase
   // history UI). Total count is exposed via X-Total-Count instead.
@@ -12,6 +13,11 @@ export default async function purchaseRoutes(fastify) {
     const { limit = 50, offset = 0, supplier, status } = req.query
     const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 50))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
+    const shopIds = await getOwnedShopIds(sql, req.user.id)
+    if (shopIds.length === 0) {
+      reply.header('X-Total-Count', 0)
+      return []
+    }
 
     const [purchases, [{ total }]] = await Promise.all([
       sql`
@@ -20,7 +26,8 @@ export default async function purchaseRoutes(fastify) {
         FROM purchases p
         LEFT JOIN users u ON u.id = p.created_by
         LEFT JOIN purchase_items pi ON pi.purchase_id = p.id
-        WHERE (${supplier ?? null}::text IS NULL OR p.supplier ILIKE ${'%' + (supplier ?? '') + '%'})
+        WHERE p.shop_id = ANY(${shopIds})
+          AND (${supplier ?? null}::text IS NULL OR p.supplier ILIKE ${'%' + (supplier ?? '') + '%'})
           AND (${status ?? null}::text IS NULL OR p.status = ${status ?? null})
         GROUP BY p.id, u.name
         ORDER BY p.created_at DESC
@@ -28,7 +35,8 @@ export default async function purchaseRoutes(fastify) {
       `,
       sql`
         SELECT COUNT(*)::int AS total FROM purchases p
-        WHERE (${supplier ?? null}::text IS NULL OR p.supplier ILIKE ${'%' + (supplier ?? '') + '%'})
+        WHERE p.shop_id = ANY(${shopIds})
+          AND (${supplier ?? null}::text IS NULL OR p.supplier ILIKE ${'%' + (supplier ?? '') + '%'})
           AND (${status ?? null}::text IS NULL OR p.status = ${status ?? null})
       `,
     ])
@@ -39,11 +47,12 @@ export default async function purchaseRoutes(fastify) {
 
   // GET /api/purchases/:id  (with line items)
   fastify.get('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
+    const shopIds = await getOwnedShopIds(sql, req.user.id)
     const [purchase] = await sql`
       SELECT p.*, u.name AS created_by_name
       FROM purchases p
       LEFT JOIN users u ON u.id = p.created_by
-      WHERE p.id = ${req.params.id}
+      WHERE p.id = ${req.params.id} AND p.shop_id = ANY(${shopIds})
     `
     if (!purchase) return reply.code(404).send({ error: 'Purchase not found' })
 
@@ -57,13 +66,14 @@ export default async function purchaseRoutes(fastify) {
     schema: {
       body: {
         type: 'object',
-        required: ['items'],
+        required: ['items', 'shop_id'],
         properties: {
           invoice_no: { type: ['string', 'null'] },
           supplier: { type: ['string', 'null'] },
           purchase_date: { type: ['string', 'null'] },
           notes: { type: ['string', 'null'] },
           gst_pct: { type: ['number', 'null'], minimum: 0, maximum: 100 },
+          shop_id: { type: 'integer' },
           items: {
             type: 'array',
             minItems: 1,
@@ -83,18 +93,19 @@ export default async function purchaseRoutes(fastify) {
       },
     },
   }, async (req, reply) => {
-    const { invoice_no, supplier, purchase_date, items, notes, gst_pct = 0 } = req.body
+    const { invoice_no, supplier, purchase_date, items, notes, gst_pct = 0, shop_id } = req.body
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, shop_id)
 
     const subtotal = items.reduce((s, i) => s + Number(i.unit_price) * Number(i.qty), 0)
     const gst_amt  = Math.round(subtotal * Number(gst_pct) / 100 * 100) / 100
 
     const purchase = await sql.begin(async tx => {
       const [p] = await tx`
-        INSERT INTO purchases (invoice_no, supplier, purchase_date, subtotal, gst_pct, gst_amt, notes, created_by)
+        INSERT INTO purchases (invoice_no, supplier, purchase_date, subtotal, gst_pct, gst_amt, notes, created_by, shop_id)
         VALUES (
           ${invoice_no ?? null}, ${supplier ?? null},
           ${purchase_date ?? new Date().toISOString().slice(0, 10)},
-          ${subtotal}, ${gst_pct}, ${gst_amt}, ${notes ?? null}, ${req.user.id}
+          ${subtotal}, ${gst_pct}, ${gst_amt}, ${notes ?? null}, ${req.user.id}, ${shop_id}
         )
         RETURNING *
       `
@@ -109,10 +120,17 @@ export default async function purchaseRoutes(fastify) {
         `
 
         if (item.product_id) {
-          await tx`
+          // Only add stock to a product that actually belongs to this
+          // purchase's shop — otherwise a purchase for Shop A could
+          // silently inflate Shop B's inventory.
+          const [updated] = await tx`
             UPDATE products SET stock = stock + ${item.qty}, updated_at = NOW()
-            WHERE id = ${item.product_id}
+            WHERE id = ${item.product_id} AND shop_id = ${shop_id}
+            RETURNING id
           `
+          if (!updated) {
+            throw fastify.httpErrors.badRequest(`Product "${item.name}" does not belong to this shop`)
+          }
           await tx`
             INSERT INTO stock_movements (product_id, type, qty, note, ref_id, created_by)
             VALUES (${item.product_id}, 'in', ${item.qty},
@@ -129,7 +147,7 @@ export default async function purchaseRoutes(fastify) {
 
     await logActivity(sql, {
       userId: req.user.id, action: 'purchase_created', entity: 'purchase',
-      entityId: purchase.id, meta: { supplier, subtotal }, ip: req.ip,
+      entityId: purchase.id, meta: { supplier, subtotal, shop_id }, ip: req.ip,
     })
 
     const items_saved = await sql`SELECT * FROM purchase_items WHERE purchase_id = ${purchase.id}`
@@ -139,6 +157,7 @@ export default async function purchaseRoutes(fastify) {
   // PATCH /api/purchases/:id — update status / notes (admin only)
   fastify.patch('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
     const { status, notes, supplier, invoice_no, purchase_date } = req.body
+    const shopIds = await getOwnedShopIds(sql, req.user.id)
 
     const [purchase] = await sql`
       UPDATE purchases SET
@@ -148,7 +167,7 @@ export default async function purchaseRoutes(fastify) {
         invoice_no    = COALESCE(${invoice_no    ?? null}, invoice_no),
         purchase_date = COALESCE(${purchase_date ?? null}, purchase_date),
         updated_at    = NOW()
-      WHERE id = ${req.params.id}
+      WHERE id = ${req.params.id} AND shop_id = ANY(${shopIds})
       RETURNING *
     `
     if (!purchase) return reply.code(404).send({ error: 'Purchase not found' })
@@ -164,9 +183,10 @@ export default async function purchaseRoutes(fastify) {
   // DELETE /api/purchases/:id (admin only) — soft cancel instead of hard delete,
   // so purchase history and stock provenance are preserved.
   fastify.delete('/:id', { preHandler: requireRole('admin') }, async (req, reply) => {
+    const shopIds = await getOwnedShopIds(sql, req.user.id)
     const [purchase] = await sql`
       UPDATE purchases SET status = 'cancelled', updated_at = NOW()
-      WHERE id = ${req.params.id} RETURNING id
+      WHERE id = ${req.params.id} AND shop_id = ANY(${shopIds}) RETURNING id
     `
     if (!purchase) return reply.code(404).send({ error: 'Purchase not found' })
 

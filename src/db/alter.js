@@ -215,6 +215,122 @@ async function alter() {
   await sql`CREATE INDEX IF NOT EXISTS idx_bills_payment_method ON bills(payment_method)`
   console.log('✅ idx_bills_payment_method ready.')
 
+  // ── Multi-Admin / Multi-Shop / Multi-Cashier ─────────────────────────────
+  // New hierarchy: Admin -> many Shops -> many Cashiers. Every shop-scoped
+  // entity gets a shop_id. Existing (pre-migration) data belonged to a
+  // single implicit shop, so it's backfilled into a real "Main Shop" owned
+  // by the earliest admin account rather than left orphaned.
+  await sql`
+    CREATE TABLE IF NOT EXISTS shops (
+      id          SERIAL PRIMARY KEY,
+      admin_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      name        TEXT,
+      location    TEXT NOT NULL,
+      active      BOOLEAN NOT NULL DEFAULT TRUE,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_shops_admin_id ON shops(admin_id)`
+  console.log('✅ shops table ready.')
+
+  // Cashiers belong to exactly one shop at a time. Admins own shops via
+  // shops.admin_id instead of belonging to one, so this stays nullable.
+  await sql`ALTER TABLE users ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL`
+  await sql`CREATE INDEX IF NOT EXISTS idx_users_shop_id ON users(shop_id)`
+  console.log('✅ users.shop_id ready.')
+
+  // Shop-scoped entities. Products/customers/suppliers cascade with their
+  // shop (they're owned data); bills/expenses/purchases/sessions use
+  // SET NULL so historical financial records are never silently deleted
+  // just because a shop was removed.
+  await sql`ALTER TABLE products  ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE`
+  await sql`ALTER TABLE customers ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE`
+  await sql`ALTER TABLE suppliers ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE`
+  await sql`ALTER TABLE bills     ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL`
+  await sql`ALTER TABLE expenses  ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL`
+  await sql`ALTER TABLE purchases ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL`
+  await sql`ALTER TABLE sessions  ADD COLUMN IF NOT EXISTS shop_id INTEGER REFERENCES shops(id) ON DELETE SET NULL`
+  await sql`CREATE INDEX IF NOT EXISTS idx_products_shop_id  ON products(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_customers_shop_id ON customers(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_suppliers_shop_id ON suppliers(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_bills_shop_id     ON bills(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_expenses_shop_id  ON expenses(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_purchases_shop_id ON purchases(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_sessions_shop_id  ON sessions(shop_id)`
+  console.log('✅ shop_id columns + indexes ready on all shop-scoped tables.')
+
+  // ── Backfill: give pre-existing single-tenant data a real home shop ──────
+  // Before this migration the app only ever had one implicit shop. Rather
+  // than leave every existing row with shop_id = NULL (which would make it
+  // invisible under the new shop-scoped queries), create a "Main Shop"
+  // owned by the earliest admin account and attach all pre-existing
+  // unscoped data — and cashiers — to it.
+  const [earliestAdmin] = await sql`
+    SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1
+  `
+  if (earliestAdmin) {
+    const [mainShop] = await sql`
+      INSERT INTO shops (admin_id, name, location)
+      SELECT ${earliestAdmin.id}, 'Main Shop', 'Main'
+      WHERE NOT EXISTS (SELECT 1 FROM shops WHERE admin_id = ${earliestAdmin.id})
+      RETURNING id
+    `
+    const shopId = mainShop?.id ?? (
+      await sql`SELECT id FROM shops WHERE admin_id = ${earliestAdmin.id} ORDER BY id ASC LIMIT 1`
+    )[0]?.id
+
+    if (shopId) {
+      await sql`UPDATE users     SET shop_id = ${shopId} WHERE role = 'cashier' AND shop_id IS NULL`
+      await sql`UPDATE products  SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      await sql`UPDATE customers SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      await sql`UPDATE suppliers SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      await sql`UPDATE bills     SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      await sql`UPDATE expenses  SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      await sql`UPDATE purchases SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      await sql`UPDATE sessions  SET shop_id = ${shopId} WHERE shop_id IS NULL`
+      console.log(`✅ Backfilled pre-existing data into shop #${shopId} (owned by admin #${earliestAdmin.id}).`)
+    }
+  } else {
+    console.log('ℹ️  No existing admin found — skipping shop backfill (fresh database).')
+  }
+
+  // ── Enforce the new isolation rules at the database level ───────────────
+  // A cashier without a shop shouldn't exist going forward (they'd fall
+  // through every shop-scoped query and effectively see nothing).
+  await sql`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_cashier_has_shop`
+  await sql`
+    ALTER TABLE users
+    ADD CONSTRAINT users_cashier_has_shop
+    CHECK (role != 'cashier' OR shop_id IS NOT NULL)
+  `
+  console.log('✅ users_cashier_has_shop constraint ready.')
+
+  // Product/customer/supplier isolation is core to shop-level data
+  // separation (rule 13) — these should never be shop-less going forward.
+  await sql`ALTER TABLE products  ALTER COLUMN shop_id SET NOT NULL`
+  await sql`ALTER TABLE customers ALTER COLUMN shop_id SET NOT NULL`
+  await sql`ALTER TABLE suppliers ALTER COLUMN shop_id SET NOT NULL`
+  console.log('✅ products/customers/suppliers.shop_id now NOT NULL.')
+
+  // ── Split payments ────────────────────────────────────────────────────────
+  // A bill with payment_method = 'split' now retains its individual payment
+  // portions here instead of collapsing them into a single opaque amount.
+  // 'gpay' is accepted as an input alias for 'upi' at the route layer (see
+  // bills.js) so it lands in the same reporting bucket as existing UPI
+  // sales rather than fragmenting payment-method reports.
+  await sql`
+    CREATE TABLE IF NOT EXISTS bill_payments (
+      id          SERIAL PRIMARY KEY,
+      bill_id     INTEGER NOT NULL REFERENCES bills(id) ON DELETE CASCADE,
+      method      TEXT NOT NULL CHECK (method IN ('cash','card','upi','net_banking')),
+      amount      NUMERIC(10,2) NOT NULL CHECK (amount > 0),
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_bill_payments_bill_id ON bill_payments(bill_id)`
+  console.log('✅ bill_payments table ready.')
+
   await sql.end()
 }
 

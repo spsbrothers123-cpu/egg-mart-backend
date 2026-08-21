@@ -2,6 +2,8 @@ import sql from '../config/db.js'
 import { authenticate, requireRole } from '../middleware/auth.js'
 import { logActivity } from '../utils/audit.js'
 import { cacheInvalidate } from '../utils/cache.js'
+import { getOwnedShopIds, assertShopOwnedByAdmin, requireCashierShop, resolveAdminShopId } from '../utils/shop-scope.js'
+import { validateSplitPayments } from '../utils/split-payment.js'
 
 // Generates an atomic, gap-free invoice number in the form YYYYMMDD-00001.
 // MUST be called with `tx` (the transaction client for the bill being
@@ -24,7 +26,7 @@ async function generateInvoiceNumber(tx) {
 }
 
 export default async function billRoutes(fastify) {
-  // GET /api/bills — paginated, filterable.
+  // GET /api/bills — paginated, filterable, shop-scoped.
   // Returns a bare array (unchanged response shape, for frontend
   // backward-compatibility) with the total row count exposed via the
   // X-Total-Count header for callers that want to paginate.
@@ -32,6 +34,25 @@ export default async function billRoutes(fastify) {
     const { date, customer_id, status, limit = 50, offset = 0 } = req.query
     const safeLimit = Math.min(200, Math.max(1, parseInt(limit) || 50))
     const safeOffset = Math.max(0, parseInt(offset) || 0)
+
+    let shopIds
+    if (req.user.role === 'admin') {
+      shopIds = await getOwnedShopIds(sql, req.user.id)
+      // Optional ?shop_id= filter for an admin narrowing to one of their shops.
+      if (req.query.shop_id) {
+        const requested = parseInt(req.query.shop_id)
+        if (!shopIds.includes(requested)) {
+          return reply.code(403).send({ error: 'That shop does not belong to your account' })
+        }
+        shopIds = [requested]
+      }
+    } else {
+      shopIds = req.user.shop_id ? [req.user.shop_id] : []
+    }
+    if (shopIds.length === 0) {
+      reply.header('X-Total-Count', 0)
+      return []
+    }
 
     const [rows, [{ total }]] = await Promise.all([
       sql`
@@ -41,7 +62,8 @@ export default async function billRoutes(fastify) {
         LEFT JOIN customers c  ON c.id  = b.customer_id
         LEFT JOIN users     u  ON u.id  = b.cashier_id
         LEFT JOIN bill_items bi ON bi.bill_id = b.id
-        WHERE (${date ?? null}::date IS NULL OR b.created_at::date = ${date ?? null}::date)
+        WHERE b.shop_id = ANY(${shopIds})
+          AND (${date ?? null}::date IS NULL OR b.created_at::date = ${date ?? null}::date)
           AND (${customer_id ?? null}::int IS NULL OR b.customer_id = ${customer_id ?? null}::int)
           AND (${status ?? null}::text IS NULL OR b.payment_status = ${status ?? null})
         GROUP BY b.id, c.name, u.name
@@ -51,7 +73,8 @@ export default async function billRoutes(fastify) {
       sql`
         SELECT COUNT(*)::int AS total
         FROM bills b
-        WHERE (${date ?? null}::date IS NULL OR b.created_at::date = ${date ?? null}::date)
+        WHERE b.shop_id = ANY(${shopIds})
+          AND (${date ?? null}::date IS NULL OR b.created_at::date = ${date ?? null}::date)
           AND (${customer_id ?? null}::int IS NULL OR b.customer_id = ${customer_id ?? null}::int)
           AND (${status ?? null}::text IS NULL OR b.payment_status = ${status ?? null})
       `,
@@ -61,7 +84,7 @@ export default async function billRoutes(fastify) {
     return rows
   })
 
-  // GET /api/bills/:id  (with items)
+  // GET /api/bills/:id  (with items + split-payment portions if any)
   fastify.get('/:id', { preHandler: authenticate }, async (req, reply) => {
     const [bill] = await sql`
       SELECT b.*, c.name AS customer_name, c.phone AS customer_phone, u.name AS cashier_name
@@ -72,8 +95,17 @@ export default async function billRoutes(fastify) {
     `
     if (!bill) return reply.code(404).send({ error: 'Bill not found' })
 
+    if (req.user.role === 'cashier') {
+      if (bill.shop_id !== req.user.shop_id) return reply.code(404).send({ error: 'Bill not found' })
+    } else {
+      await assertShopOwnedByAdmin(fastify, sql, req.user.id, bill.shop_id)
+    }
+
     const items = await sql`SELECT * FROM bill_items WHERE bill_id = ${bill.id}`
-    return { ...bill, items }
+    const payments = bill.payment_method === 'split'
+      ? await sql`SELECT * FROM bill_payments WHERE bill_id = ${bill.id} ORDER BY id`
+      : []
+    return { ...bill, items, payments }
   })
 
   // POST /api/bills — create a new bill
@@ -91,6 +123,7 @@ export default async function billRoutes(fastify) {
         type: 'object',
         required: ['items'],
         properties: {
+          shop_id: { type: ['integer', 'null'] }, // admins only; cashiers always use their own shop
           customer_id: { type: ['integer', 'null'] },
           items: {
             type: 'array',
@@ -110,6 +143,22 @@ export default async function billRoutes(fastify) {
           discount_pct: { type: 'number', minimum: 0, maximum: 100 },
           tax_pct: { type: 'number', minimum: 0, maximum: 100 },
           payment_method: { type: 'string', enum: ['cash', 'card', 'upi', 'net_banking', 'split', 'credit'] },
+          // Present only when payment_method === 'split'. Exactly two
+          // portions for now (see alter.js / bill_payments comment) — the
+          // shape supports more later without an API change.
+          payments: {
+            type: 'array',
+            minItems: 2,
+            maxItems: 2,
+            items: {
+              type: 'object',
+              required: ['method', 'amount'],
+              properties: {
+                method: { type: 'string', enum: ['cash', 'card', 'upi', 'net_banking', 'gpay'] },
+                amount: { type: 'number', exclusiveMinimum: 0 },
+              },
+            },
+          },
           notes: { type: ['string', 'null'] },
         },
       },
@@ -121,13 +170,35 @@ export default async function billRoutes(fastify) {
       discount_pct = 0,
       tax_pct      = 0,
       payment_method = 'cash',
+      payments,
       notes,
     } = req.body
+
+    // Shop access is always derived from the authenticated user, never a
+    // client-supplied field — a cashier can never bill for another shop.
+    let shop_id
+    if (req.user.role === 'cashier') {
+      requireCashierShop(fastify, req)
+      shop_id = req.user.shop_id
+    } else {
+      // Admin path: shop_id optional, defaults to the admin's sole shop.
+      shop_id = await resolveAdminShopId(fastify, sql, req.user.id, req.body.shop_id)
+    }
 
     const subtotal     = items.reduce((s, i) => s + i.price * i.qty, 0)
     const discount_amt = Math.round(subtotal * discount_pct / 100 * 100) / 100
     const tax_amt      = Math.round((subtotal - discount_amt) * tax_pct / 100 * 100) / 100
     const total        = subtotal - discount_amt + tax_amt
+
+    // ── Server-side split-payment validation (never trust the frontend) ──
+    let normalizedPayments = null
+    if (payment_method === 'split') {
+      const result = validateSplitPayments(payments, total)
+      if (!result.ok) return reply.code(400).send({ error: result.error })
+      normalizedPayments = result.payments
+    } else if (payments) {
+      return reply.code(400).send({ error: '"payments" is only allowed when payment_method is "split"' })
+    }
 
     let bill
     try {
@@ -141,14 +212,23 @@ export default async function billRoutes(fastify) {
 
         const [b] = await tx`
           INSERT INTO bills
-            (invoice_number, customer_id, cashier_id, subtotal, discount_pct, discount_amt,
+            (invoice_number, customer_id, cashier_id, shop_id, subtotal, discount_pct, discount_amt,
              tax_pct, tax_amt, total, payment_method, payment_status, notes)
           VALUES
-            (${invoice_number}, ${customer_id ?? null}, ${req.user.id},
+            (${invoice_number}, ${customer_id ?? null}, ${req.user.id}, ${shop_id},
              ${subtotal}, ${discount_pct}, ${discount_amt},
              ${tax_pct}, ${tax_amt}, ${total}, ${payment_method}, ${payment_status}, ${notes ?? null})
           RETURNING *
         `
+
+        if (normalizedPayments) {
+          for (const p of normalizedPayments) {
+            await tx`
+              INSERT INTO bill_payments (bill_id, method, amount)
+              VALUES (${b.id}, ${p.method}, ${p.amount})
+            `
+          }
+        }
 
         for (const item of items) {
           await tx`
@@ -161,17 +241,20 @@ export default async function billRoutes(fastify) {
             // Atomic stock check-and-deduct: the WHERE clause guarantees we
             // never go negative even under concurrent checkouts, because the
             // row lock serializes competing UPDATEs on the same product.
+            // Also scoped to this bill's shop, so a product can't be
+            // deducted against a different shop's stock.
             const [updated] = await tx`
               UPDATE products SET stock = stock - ${item.qty}, updated_at = NOW()
-              WHERE id = ${item.product_id} AND stock >= ${item.qty}
+              WHERE id = ${item.product_id} AND shop_id = ${shop_id} AND stock >= ${item.qty}
               RETURNING id, name, stock
             `
             if (!updated) {
-              const [product] = await tx`SELECT name, stock FROM products WHERE id = ${item.product_id}`
-              const available = product?.stock ?? 0
-              const label = product?.name ?? item.name
+              const [product] = await tx`SELECT name, stock FROM products WHERE id = ${item.product_id} AND shop_id = ${shop_id}`
+              if (!product) {
+                throw fastify.httpErrors.badRequest(`Product "${item.name}" does not belong to this shop`)
+              }
               throw fastify.httpErrors.badRequest(
-                `Insufficient stock for "${label}": ${available} available, ${item.qty} requested`
+                `Insufficient stock for "${product.name}": ${product.stock} available, ${item.qty} requested`
               )
             }
 
@@ -191,7 +274,7 @@ export default async function billRoutes(fastify) {
           // customer can't both read a stale credit_used and both pass the
           // limit check (the classic check-then-act race).
           const [customer] = await tx`
-            SELECT credit_limit, credit_used FROM customers WHERE id = ${customer_id} FOR UPDATE
+            SELECT credit_limit, credit_used FROM customers WHERE id = ${customer_id} AND shop_id = ${shop_id} FOR UPDATE
           `
           if (!customer) {
             throw fastify.httpErrors.badRequest('Customer not found')
@@ -215,9 +298,10 @@ export default async function billRoutes(fastify) {
     } catch (err) {
       if (err.statusCode) throw err // validation error thrown above, already safe to surface
       if (err.code === '23514') {
-        // Postgres check-violation (e.g. bills_payment_method_check or
-        // customers_credit_used_within_limit) slipping past the app-layer
-        // checks above — surface a real 400 instead of an opaque 500.
+        // Postgres check-violation (e.g. bills_payment_method_check,
+        // bill_payments amount check, or customers_credit_used_within_limit)
+        // slipping past the app-layer checks above — surface a real 400
+        // instead of an opaque 500.
         throw fastify.httpErrors.badRequest('This sale violates a data constraint (invalid payment method or credit limit exceeded)')
       }
       throw err
@@ -235,7 +319,11 @@ export default async function billRoutes(fastify) {
       ip: req.ip,
     })
 
-    return reply.code(201).send(bill)
+    const responsePayments = normalizedPayments
+      ? await sql`SELECT * FROM bill_payments WHERE bill_id = ${bill.id} ORDER BY id`
+      : []
+
+    return reply.code(201).send({ ...bill, payments: responsePayments })
   })
 
   // PATCH /api/bills/:id/settle-credit — admin-only "Mark as Paid" action.
@@ -289,6 +377,7 @@ export default async function billRoutes(fastify) {
     })
 
     if (!bill) return reply.code(404).send({ error: 'Bill not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, bill.shop_id)
 
     cacheInvalidate('dashboard:')
 
@@ -306,6 +395,10 @@ export default async function billRoutes(fastify) {
 
   // PATCH /api/bills/:id/void
   fastify.patch('/:id/void', { preHandler: requireRole('admin') }, async (req, reply) => {
+    const [target] = await sql`SELECT shop_id FROM bills WHERE id = ${req.params.id}`
+    if (!target) return reply.code(404).send({ error: 'Bill not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, target.shop_id)
+
     const bill = await sql.begin(async tx => {
       const [existing] = await tx`SELECT * FROM bills WHERE id = ${req.params.id}`
       if (!existing) return null
