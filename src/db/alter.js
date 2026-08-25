@@ -260,58 +260,57 @@ async function alter() {
   await sql`CREATE INDEX IF NOT EXISTS idx_sessions_shop_id  ON sessions(shop_id)`
   console.log('✅ shop_id columns + indexes ready on all shop-scoped tables.')
 
-  // ── Backfill: give pre-existing single-tenant data a real home shop ──────
-  // Before this migration the app only ever had one implicit shop. Rather
-  // than leave every existing row with shop_id = NULL (which would make it
-  // invisible under the new shop-scoped queries), create a "Main Shop"
-  // owned by the earliest admin account and attach all pre-existing
-  // unscoped data — and cashiers — to it.
-  const [earliestAdmin] = await sql`
-    SELECT id FROM users WHERE role = 'admin' ORDER BY id ASC LIMIT 1
+  // ── Ownership backfill: intentionally NOT done here ──────────────────────
+  // This used to auto-attach every pre-existing row with shop_id = NULL to
+  // "the earliest admin" via `SELECT ... ORDER BY id ASC LIMIT 1`. On any
+  // database with more than one admin account, that's a guess, not a fact —
+  // it can silently hand one admin's products, cashiers, and financial
+  // history to a different admin, with no confirmation and no way to tell
+  // afterward that it happened.
+  //
+  // Ownership backfill is a one-time, operator-reviewed action now, not an
+  // automatic step of routine schema migrations. This block only *reports*
+  // whether unassigned data exists; it never writes.
+  //
+  //   Diagnose:  node src/db/diagnose.js
+  //   Backfill:  node src/db/backfill-ownership.js --admin-id=<id> --confirm
+  //
+  // backfill-ownership.js enforces: no auto-selection of "the" admin when
+  // more than one exists, dry-run by default, a full report of exactly what
+  // will change before anything writes, and it only ever touches rows that
+  // are currently shop_id IS NULL — an already-assigned row is never
+  // reassigned.
+  const [{ count: unassignedCount }] = await sql`
+    SELECT (
+      (SELECT COUNT(*) FROM users     WHERE role = 'cashier' AND shop_id IS NULL) +
+      (SELECT COUNT(*) FROM products  WHERE shop_id IS NULL) +
+      (SELECT COUNT(*) FROM customers WHERE shop_id IS NULL) +
+      (SELECT COUNT(*) FROM suppliers WHERE shop_id IS NULL)
+    )::int AS count
   `
-  if (earliestAdmin) {
-    const [mainShop] = await sql`
-      INSERT INTO shops (admin_id, name, location)
-      SELECT ${earliestAdmin.id}, 'Main Shop', 'Main'
-      WHERE NOT EXISTS (SELECT 1 FROM shops WHERE admin_id = ${earliestAdmin.id})
-      RETURNING id
-    `
-    const shopId = mainShop?.id ?? (
-      await sql`SELECT id FROM shops WHERE admin_id = ${earliestAdmin.id} ORDER BY id ASC LIMIT 1`
-    )[0]?.id
-
-    if (shopId) {
-      await sql`UPDATE users     SET shop_id = ${shopId} WHERE role = 'cashier' AND shop_id IS NULL`
-      await sql`UPDATE products  SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      await sql`UPDATE customers SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      await sql`UPDATE suppliers SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      await sql`UPDATE bills     SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      await sql`UPDATE expenses  SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      await sql`UPDATE purchases SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      await sql`UPDATE sessions  SET shop_id = ${shopId} WHERE shop_id IS NULL`
-      console.log(`✅ Backfilled pre-existing data into shop #${shopId} (owned by admin #${earliestAdmin.id}).`)
-    }
+  if (unassignedCount > 0) {
+    console.log(`⚠️  ${unassignedCount} row(s) across users/products/customers/suppliers still have shop_id = NULL.`)
+    console.log('    This migration will NOT guess an owner. Run the diagnostic and backfill scripts:')
+    console.log('      node src/db/diagnose.js')
+    console.log('      node src/db/backfill-ownership.js --admin-id=<id> --confirm')
+    console.log('    The NOT NULL constraints and cashier-shop constraint below are skipped until that is done.')
   } else {
-    console.log('ℹ️  No existing admin found — skipping shop backfill (fresh database).')
+    // Only tighten these constraints once there is nothing left unassigned —
+    // enforcing them while NULLs still exist would hard-fail the migration
+    // instead of giving the operator a chance to review and backfill first.
+    await sql`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_cashier_has_shop`
+    await sql`
+      ALTER TABLE users
+      ADD CONSTRAINT users_cashier_has_shop
+      CHECK (role != 'cashier' OR shop_id IS NOT NULL)
+    `
+    console.log('✅ users_cashier_has_shop constraint ready.')
+
+    await sql`ALTER TABLE products  ALTER COLUMN shop_id SET NOT NULL`
+    await sql`ALTER TABLE customers ALTER COLUMN shop_id SET NOT NULL`
+    await sql`ALTER TABLE suppliers ALTER COLUMN shop_id SET NOT NULL`
+    console.log('✅ products/customers/suppliers.shop_id now NOT NULL.')
   }
-
-  // ── Enforce the new isolation rules at the database level ───────────────
-  // A cashier without a shop shouldn't exist going forward (they'd fall
-  // through every shop-scoped query and effectively see nothing).
-  await sql`ALTER TABLE users DROP CONSTRAINT IF EXISTS users_cashier_has_shop`
-  await sql`
-    ALTER TABLE users
-    ADD CONSTRAINT users_cashier_has_shop
-    CHECK (role != 'cashier' OR shop_id IS NOT NULL)
-  `
-  console.log('✅ users_cashier_has_shop constraint ready.')
-
-  // Product/customer/supplier isolation is core to shop-level data
-  // separation (rule 13) — these should never be shop-less going forward.
-  await sql`ALTER TABLE products  ALTER COLUMN shop_id SET NOT NULL`
-  await sql`ALTER TABLE customers ALTER COLUMN shop_id SET NOT NULL`
-  await sql`ALTER TABLE suppliers ALTER COLUMN shop_id SET NOT NULL`
-  console.log('✅ products/customers/suppliers.shop_id now NOT NULL.')
 
   // ── Split payments ────────────────────────────────────────────────────────
   // A bill with payment_method = 'split' now retains its individual payment
@@ -330,6 +329,30 @@ async function alter() {
   `
   await sql`CREATE INDEX IF NOT EXISTS idx_bill_payments_bill_id ON bill_payments(bill_id)`
   console.log('✅ bill_payments table ready.')
+
+  // ── Shop invites (Phase 2 security fix) ──────────────────────────────────
+  // Replaces free-text `shop_location` matching on public cashier signup
+  // (POST /api/auth/register), which let anyone join any shop whose
+  // location string they could guess — a cross-tenant vulnerability, since
+  // location is public-facing text (receipts, storefront signage), not a
+  // secret. Cashier self-registration now requires a single-use,
+  // expiring, admin-issued invite code tied to exactly one shop_id.
+  await sql`
+    CREATE TABLE IF NOT EXISTS shop_invites (
+      id          SERIAL PRIMARY KEY,
+      shop_id     INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+      code        TEXT NOT NULL UNIQUE,
+      created_by  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      used_at     TIMESTAMPTZ,
+      used_by     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      revoked_at  TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `
+  await sql`CREATE INDEX IF NOT EXISTS idx_shop_invites_shop_id ON shop_invites(shop_id)`
+  await sql`CREATE INDEX IF NOT EXISTS idx_shop_invites_code    ON shop_invites(code)`
+  console.log('✅ shop_invites table ready.')
 
   await sql.end()
 }

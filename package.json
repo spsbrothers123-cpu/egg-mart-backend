@@ -10,6 +10,9 @@
     "migrate": "node src/db/migrate.js",
     "alter": "node src/db/alter.js",
     "seed": "node src/db/seed.js",
+    "diagnose": "node src/db/diagnose.js",
+    "backfill-ownership": "node src/db/backfill-ownership.js",
+    "recover-products": "node src/db/recover-products.js",
     "test": "node --test"
   },
   "dependencies": {

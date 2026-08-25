@@ -41,7 +41,7 @@ export default async function customerRoutes(fastify) {
 
     const bills = await sql`
       SELECT id, invoice_number, total, payment_status, payment_method, created_at
-      FROM bills WHERE customer_id = ${req.params.id} ORDER BY created_at DESC LIMIT 20
+      FROM bills WHERE customer_id = ${req.params.id} AND shop_id = ANY(${shopIds}) ORDER BY created_at DESC LIMIT 20
     `
     return { ...customer, bills }
   })

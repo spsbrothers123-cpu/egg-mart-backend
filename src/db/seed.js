@@ -1,18 +1,75 @@
 import 'dotenv/config'
+import crypto from 'crypto'
 import bcrypt from 'bcryptjs'
 import sql from '../config/db.js'
+import { validatePasswordPolicy } from '../utils/password.js'
+
+// Refuse to run against production at all. Seeding inserts/overwrites the
+// admin and cashier accounts with either a caller-supplied or a freshly
+// generated password — neither of those belongs anywhere near real
+// customer/production data, and there is no legitimate reason to run this
+// script there.
+if (process.env.NODE_ENV === 'production') {
+  console.error('❌ Refusing to run: NODE_ENV=production.')
+  console.error('   The seed script is for local/development databases only.')
+  process.exit(1)
+}
+
+// Generates a random password that satisfies the app's own password policy
+// (8+ chars, upper, lower, number, special) — never a fixed, well-known
+// default like "admin123" that would otherwise ship identically to every
+// developer's local database.
+function generateDevPassword() {
+  const upper   = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
+  const lower   = 'abcdefghijkmnopqrstuvwxyz'
+  const digits  = '23456789'
+  const special = '!@#$%^&*'
+  const all     = upper + lower + digits + special
+  const pick    = set => set[crypto.randomInt(set.length)]
+
+  const chars = [pick(upper), pick(lower), pick(digits), pick(special)]
+  for (let i = 0; i < 8; i++) chars.push(pick(all))
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1)
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+  return chars.join('')
+}
+
+// Resolves a credential from an env var if the developer provided one
+// (validated against the same password policy the app enforces everywhere
+// else), otherwise generates a fresh random one for this run.
+function resolveCredential(envVar) {
+  const provided = process.env[envVar]
+  if (provided) {
+    const policyError = validatePasswordPolicy(provided)
+    if (policyError) {
+      console.error(`❌ ${envVar} does not meet the password policy: ${policyError}`)
+      process.exit(1)
+    }
+    return { value: provided, generated: false }
+  }
+  return { value: generateDevPassword(), generated: true }
+}
 
 async function seed() {
   console.log('🌱 Seeding database...')
 
-  // Users
-  const adminHash   = await bcrypt.hash('admin123', 10)
-  const cashierHash = await bcrypt.hash('1234', 10)
+  // Users — credentials come from SEED_ADMIN_PASSWORD / SEED_CASHIER_PASSWORD
+  // if set, otherwise a random dev password is generated per run. Real
+  // (i.e. explicitly caller-provided) credentials are never logged — only
+  // freshly generated ones are, since those exist nowhere else and the
+  // developer has no other way to learn them.
+  const adminCred   = resolveCredential('SEED_ADMIN_PASSWORD')
+  const cashierCred = resolveCredential('SEED_CASHIER_PASSWORD')
+
+  const adminHash   = await bcrypt.hash(adminCred.value, 10)
+  const cashierHash = await bcrypt.hash(cashierCred.value, 10)
 
   const [admin] = await sql`
     INSERT INTO users (name, username, password, role) VALUES
       ('Admin', 'admin', ${adminHash}, 'admin')
-    ON CONFLICT (username) DO UPDATE SET name = EXCLUDED.name
+    ON CONFLICT (username) DO UPDATE SET name = EXCLUDED.name, password = ${adminHash}
     RETURNING id
   `
 
@@ -29,13 +86,12 @@ async function seed() {
   await sql`
     INSERT INTO users (name, username, password, role, shop_id) VALUES
       ('Cashier One', 'cashier', ${cashierHash}, 'cashier', ${shopId})
-    ON CONFLICT (username) DO UPDATE SET shop_id = EXCLUDED.shop_id
+    ON CONFLICT (username) DO UPDATE SET shop_id = EXCLUDED.shop_id, password = ${cashierHash}
   `
-  console.warn(
-    '⚠️  Seeded with default credentials (admin/admin123, cashier/1234). ' +
-    'These do NOT meet the app\'s own password policy and are for local/dev use only — ' +
-    'rotate both passwords before going to production.'
-  )
+
+  console.warn('⚠️  Seeded dev accounts — credentials are for local/dev use only, never reuse in production:')
+  console.warn(`   admin / ${adminCred.generated ? adminCred.value : '(using SEED_ADMIN_PASSWORD you provided)'}`)
+  console.warn(`   cashier / ${cashierCred.generated ? cashierCred.value : '(using SEED_CASHIER_PASSWORD you provided)'}`)
 
   // Categories — full set matching the frontend
   await sql`

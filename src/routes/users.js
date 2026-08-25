@@ -3,27 +3,48 @@ import sql from '../config/db.js'
 import { requireRole } from '../middleware/auth.js'
 import { validatePasswordPolicy } from '../utils/password.js'
 import { logActivity } from '../utils/audit.js'
-import { getOwnedShopIds, assertShopOwnedByAdmin } from '../utils/shop-scope.js'
+import { getOwnedShopIds, assertShopOwnedByAdmin, assertCashierVisibleToAdmin } from '../utils/shop-scope.js'
 
 export default async function userRoutes(fastify) {
   // GET /api/users — "Users & Sessions": cashiers belonging to this admin's
   // shops (never another admin's cashiers, never other admin accounts).
+  //
+  // Uses a LEFT JOIN (not INNER JOIN) against shops so that a cashier whose
+  // shop_id has gone NULL — e.g. their shop was deleted, which sets
+  // users.shop_id to NULL via ON DELETE SET NULL — still appears instead of
+  // silently vanishing from the list. Since such a cashier no longer has a
+  // shop to derive ownership from, authorization for the NULL-shop_id case
+  // falls back to activity_logs: only the admin who originally created that
+  // cashier account can see it. This never exposes another admin's shops or
+  // cashiers — a cashier is included only if it's currently in one of this
+  // admin's shops OR this admin's own creation record says it's theirs.
   fastify.get('/', { preHandler: requireRole('admin') }, async (req) => {
     const shopIds = await getOwnedShopIds(sql, req.user.id)
-    if (shopIds.length === 0) return []
 
     const rows = await sql`
       SELECT u.id, u.name, u.username, u.role, u.active, u.created_at, u.updated_at,
              s.id AS shop_id, s.name AS shop_name, s.location AS shop_location
       FROM users u
-      JOIN shops s ON s.id = u.shop_id
-      WHERE u.role = 'cashier' AND u.shop_id = ANY(${shopIds})
+      LEFT JOIN shops s ON s.id = u.shop_id
+      WHERE u.role = 'cashier'
+        AND (
+          u.shop_id = ANY(${shopIds})
+          OR (
+            u.shop_id IS NULL
+            AND EXISTS (
+              SELECT 1 FROM activity_logs al
+              WHERE al.entity = 'user' AND al.entity_id = u.id
+                AND al.action = 'user_created' AND al.user_id = ${req.user.id}
+            )
+          )
+        )
       ORDER BY u.id
     `
     return rows.map(({ shop_id, shop_name, shop_location, ...u }) => ({
       ...u,
-      shop_location, // flat field for convenience — same value as shop.location
-      shop: { id: shop_id, name: shop_name, location: shop_location },
+      state: shop_id ? 'assigned' : 'unassigned',
+      shop_location, // flat field for convenience — same value as shop.location (null when unassigned)
+      shop: shop_id ? { id: shop_id, name: shop_name, location: shop_location } : null,
     }))
   })
 
@@ -49,17 +70,18 @@ export default async function userRoutes(fastify) {
   })
 
   // GET /api/users/:userId/sessions — cashier's session history (section 11).
-  // Authorization: the cashier must belong to a shop owned by this admin.
+  // Authorization: the cashier must currently belong to a shop owned by this
+  // admin, or — if orphaned (shop_id NULL, e.g. their shop was deleted) —
+  // this admin's activity_logs record must show they created that cashier.
+  // See assertCashierVisibleToAdmin for the full reasoning; this keeps the
+  // session-history endpoint consistent with what GET /api/users now shows.
   fastify.get('/:userId/sessions', { preHandler: requireRole('admin') }, async (req, reply) => {
     const [cashier] = await sql`
       SELECT id, name, username, shop_id FROM users WHERE id = ${req.params.userId} AND role = 'cashier'
     `
     if (!cashier) return reply.code(404).send({ error: 'Cashier not found' })
-    if (!cashier.shop_id) return reply.code(404).send({ error: 'Cashier is not assigned to a shop' })
 
-    // Verifies the cashier's shop belongs to the authenticated admin —
-    // this is the whole authorization check for this endpoint.
-    await assertShopOwnedByAdmin(fastify, sql, req.user.id, cashier.shop_id)
+    await assertCashierVisibleToAdmin(fastify, sql, req.user.id, cashier)
 
     const sessions = await sql`
       SELECT
@@ -160,7 +182,7 @@ export default async function userRoutes(fastify) {
       return reply.code(403).send({ error: 'Only cashier accounts can be edited here' })
     }
     // Verifies the cashier's shop belongs to the authenticated admin.
-    await assertShopOwnedByAdmin(fastify, sql, req.user.id, existing.shop_id)
+    await assertCashierVisibleToAdmin(fastify, sql, req.user.id, existing)
 
     if (username) {
       const [dup] = await sql`SELECT id FROM users WHERE username = ${username} AND id != ${req.params.id}`
@@ -205,7 +227,7 @@ export default async function userRoutes(fastify) {
     if (existing.role !== 'cashier') {
       return reply.code(403).send({ error: 'Only cashier accounts can be reset here' })
     }
-    await assertShopOwnedByAdmin(fastify, sql, req.user.id, existing.shop_id)
+    await assertCashierVisibleToAdmin(fastify, sql, req.user.id, existing)
 
     const policyError = validatePasswordPolicy(newPassword)
     if (policyError) return reply.code(400).send({ error: policyError })

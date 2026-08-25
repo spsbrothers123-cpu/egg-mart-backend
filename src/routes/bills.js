@@ -345,6 +345,15 @@ export default async function billRoutes(fastify) {
   }, async (req, reply) => {
     const { payment_method } = req.body
 
+    // Ownership must be verified BEFORE any row is touched — settling a
+    // credit bill mutates payment_status and frees the customer's credit
+    // limit, so checking shop ownership only after that write already
+    // committed would let Admin A settle (and financially affect) a bill
+    // that belongs to Admin B's shop.
+    const [target] = await sql`SELECT shop_id FROM bills WHERE id = ${req.params.id}`
+    if (!target) return reply.code(404).send({ error: 'Bill not found' })
+    await assertShopOwnedByAdmin(fastify, sql, req.user.id, target.shop_id)
+
     const bill = await sql.begin(async tx => {
       const [existing] = await tx`SELECT * FROM bills WHERE id = ${req.params.id} FOR UPDATE`
       if (!existing) return null
@@ -377,7 +386,6 @@ export default async function billRoutes(fastify) {
     })
 
     if (!bill) return reply.code(404).send({ error: 'Bill not found' })
-    await assertShopOwnedByAdmin(fastify, sql, req.user.id, bill.shop_id)
 
     cacheInvalidate('dashboard:')
 

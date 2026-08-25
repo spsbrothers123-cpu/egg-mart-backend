@@ -3,43 +3,7 @@ import sql from '../config/db.js'
 import { authenticate } from '../middleware/auth.js'
 import { validatePasswordPolicy } from '../utils/password.js'
 import { logActivity } from '../utils/audit.js'
-
-// Resolves a free-text `shop_location` (from public cashier signup) to a
-// shop_id, without ever letting a stranger attach themselves to an
-// existing shop just by guessing its name. See the /register route
-// comment for the full reasoning.
-async function resolveShopForSignup(sql, location) {
-  const matches = await sql`
-    SELECT id FROM shops WHERE active = TRUE AND LOWER(location) = LOWER(${location})
-  `
-  if (matches.length === 1) {
-    return { shopId: matches[0].id }
-  }
-  if (matches.length > 1) {
-    return {
-      error: `More than one shop is named "${location}" — ask your admin for an invite instead of signing up directly`,
-      statusCode: 409,
-    }
-  }
-
-  // No existing shop with this name — only safe to auto-create it when
-  // there's exactly one Admin account in the system to own it.
-  const admins = await sql`SELECT id FROM users WHERE role = 'admin' LIMIT 2`
-  if (admins.length === 0) {
-    return { error: 'No admin account exists yet — an admin must sign up first', statusCode: 400 }
-  }
-  if (admins.length > 1) {
-    return {
-      error: `"${location}" isn't a recognized shop yet — ask your admin to create it first`,
-      statusCode: 400,
-    }
-  }
-
-  const [shop] = await sql`
-    INSERT INTO shops (admin_id, name, location) VALUES (${admins[0].id}, ${location}, ${location}) RETURNING id
-  `
-  return { shopId: shop.id }
-}
+import { consumeShopInvite } from '../utils/shop-scope.js'
 
 export default async function authRoutes(fastify) {
   // POST /api/auth/login — strict rate limit to slow down credential stuffing / brute force
@@ -102,28 +66,24 @@ export default async function authRoutes(fastify) {
   })
 
   // POST /api/auth/register — public signup for both Admin and Cashier
-  // accounts, matching the frontend's single-endpoint contract
-  // (`{ username, password, role, shop_location? }`, `name` optional).
+  // accounts.
   //
   // Admin signup just creates a standalone account (no shop yet — shops are
   // created afterward via POST /api/shops).
   //
-  // Cashier signup is trickier: it's public and unauthenticated, so there's
-  // no admin session to derive shop ownership from, and the frontend only
-  // gives a free-text `shop_location` (not a shop_id). To resolve that
-  // without ever letting a stranger attach themselves to an arbitrary
-  // existing shop by guessing its name (which would defeat the whole
-  // isolation model), this endpoint:
-  //   1. Looks for an existing *active* shop whose location matches
-  //      case-insensitively. Exactly one match -> join it.
-  //   2. Multiple matches (rare — two different admins each named a shop
-  //      the same thing) -> refuse; ambiguous, needs an admin-issued invite.
-  //   3. No match -> only auto-creates the shop (and joins it) when there is
-  //      currently exactly one Admin account in the whole system. That's
-  //      the common single-business deployment this app is built for. If
-  //      there's more than one Admin, auto-assigning a stranger to "the"
-  //      shop would be a guess about which business they mean, so it's
-  //      refused instead — an admin must create the shop first.
+  // Cashier signup is invite-only. This endpoint used to resolve a
+  // free-text `shop_location` field to a shop by case-insensitive name
+  // match — but a shop's location/name is public-facing text (it's printed
+  // on receipts and storefront signage), so that was effectively
+  // "authorization by guessable string": anyone who saw a receipt could
+  // self-register as a cashier for that shop and immediately get read
+  // access to its products, customers, and bills. Location text is NEVER
+  // used for authorization anywhere in this codebase now.
+  //
+  // Instead, cashier signup requires `invite_code` — an unguessable,
+  // single-use, expiring token an admin explicitly issued for one specific
+  // shop_id via POST /api/shops/:id/invites. See shop-scope.js
+  // (createShopInvite / consumeShopInvite) for the enforcement.
   fastify.post('/register', {
     config: {
       rateLimit: { max: 5, timeWindow: '1 minute' },
@@ -137,36 +97,57 @@ export default async function authRoutes(fastify) {
           username: { type: 'string', minLength: 3, maxLength: 50, pattern: '^[a-zA-Z0-9_.-]+$' },
           password: { type: 'string', minLength: 8 },
           role: { type: 'string', enum: ['admin', 'cashier'] },
-          shop_location: { type: ['string', 'null'], maxLength: 200 },
+          invite_code: { type: ['string', 'null'], maxLength: 200 },
         },
       },
     },
   }, async (req, reply) => {
-    const { username, password, role, shop_location } = req.body
+    const { username, password, role, invite_code } = req.body
     const name = req.body.name?.trim() || username
 
     const policyError = validatePasswordPolicy(password)
     if (policyError) return reply.code(400).send({ error: policyError })
 
+    if (role === 'cashier' && !invite_code?.trim()) {
+      return reply.code(400).send({ error: 'invite_code is required for a cashier account — ask your admin for an invite link' })
+    }
+
     const [dup] = await sql`SELECT id FROM users WHERE username = ${username}`
     if (dup) return reply.code(409).send({ error: 'Username already exists' })
 
-    let shopId = null
-    if (role === 'cashier') {
-      const location = shop_location?.trim()
-      if (!location) return reply.code(400).send({ error: 'shop_location is required for a cashier account' })
-
-      const resolved = await resolveShopForSignup(sql, location)
-      if (resolved.error) return reply.code(resolved.statusCode).send({ error: resolved.error })
-      shopId = resolved.shopId
-    }
-
     const hashed = await bcrypt.hash(password, 10)
-    const [user] = await sql`
-      INSERT INTO users (name, username, password, role, shop_id)
-      VALUES (${name}, ${username}, ${hashed}, ${role}, ${shopId})
-      RETURNING id, name, username, role, active, shop_id, created_at
-    `
+
+    let user, shopId = null
+    try {
+      user = await sql.begin(async tx => {
+        if (role === 'cashier') {
+          // Validate + consume the invite inside the same transaction as
+          // user creation, so a code can never be redeemed twice even
+          // under concurrent requests, and a failed user insert can never
+          // leave an invite burned with no account to show for it.
+          const resolved = await consumeShopInvite(tx, invite_code.trim(), null)
+          if (resolved.error) {
+            throw Object.assign(new Error(resolved.error), { statusCode: resolved.statusCode })
+          }
+          shopId = resolved.shopId
+        }
+
+        const [u] = await tx`
+          INSERT INTO users (name, username, password, role, shop_id)
+          VALUES (${name}, ${username}, ${hashed}, ${role}, ${shopId})
+          RETURNING id, name, username, role, active, shop_id, created_at
+        `
+
+        if (role === 'cashier') {
+          await tx`UPDATE shop_invites SET used_by = ${u.id} WHERE shop_id = ${shopId} AND used_at IS NOT NULL AND used_by IS NULL`
+        }
+
+        return u
+      })
+    } catch (err) {
+      if (err.statusCode) return reply.code(err.statusCode).send({ error: err.message })
+      throw err
+    }
 
     await logActivity(sql, {
       userId: user.id, action: role === 'admin' ? 'admin_registered' : 'cashier_registered',

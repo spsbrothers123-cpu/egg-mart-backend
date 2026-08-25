@@ -1,3 +1,5 @@
+import crypto from 'node:crypto'
+
 // Central shop-authorization helpers.
 //
 // The whole multi-shop model rests on one rule: authorization is always
@@ -67,4 +69,52 @@ export function requireCashierShop(fastify, req) {
   if (req.user.role === 'cashier' && !req.user.shop_id) {
     throw fastify.httpErrors.badRequest('Your account is not assigned to a shop yet — contact your admin')
   }
+}
+
+// ── Shop invites ────────────────────────────────────────────────────────
+// Public cashier self-registration cannot derive shop ownership from a
+// session (there isn't one yet), and it must NEVER derive it from
+// client-supplied free text (shop name/location) — that's guessable and
+// lets a stranger join any shop whose name they can find on a receipt or
+// storefront sign. An invite code is an unguessable, single-use, expiring,
+// server-validated token instead — the only thing that's ever trusted to
+// answer "which shop does this signup belong to".
+
+const INVITE_BYTES = 24 // 32 URL-safe base64 characters
+
+export function generateInviteCode() {
+  return crypto.randomBytes(INVITE_BYTES).toString('base64url')
+}
+
+// Creates an invite for a shop already verified to belong to the admin
+// (call assertShopOwnedByAdmin first, or pass a shopId you've already
+// checked). Retries once on the astronomically unlikely UNIQUE collision.
+export async function createShopInvite(sql, { shopId, createdBy, expiresInHours = 24 }) {
+  const code = generateInviteCode()
+  const expiresAt = new Date(Date.now() + expiresInHours * 60 * 60 * 1000)
+  const [invite] = await sql`
+    INSERT INTO shop_invites (shop_id, code, created_by, expires_at)
+    VALUES (${shopId}, ${code}, ${createdBy}, ${expiresAt})
+    RETURNING id, shop_id, code, expires_at, created_at
+  `
+  return invite
+}
+
+// Validates and consumes an invite code atomically inside the caller's
+// transaction: locks the row, checks not-revoked / not-used / not-expired,
+// and marks it used in the same statement so two concurrent signups racing
+// on the same code can never both succeed (the row lock serializes them,
+// and the second one sees used_at already set).
+export async function consumeShopInvite(tx, code, usedByUserId) {
+  const [invite] = await tx`
+    SELECT id, shop_id, expires_at, used_at, revoked_at
+    FROM shop_invites WHERE code = ${code} FOR UPDATE
+  `
+  if (!invite) return { error: 'Invalid invite code', statusCode: 400 }
+  if (invite.revoked_at) return { error: 'This invite has been revoked', statusCode: 400 }
+  if (invite.used_at) return { error: 'This invite has already been used', statusCode: 400 }
+  if (invite.expires_at < new Date()) return { error: 'This invite has expired', statusCode: 400 }
+
+  await tx`UPDATE shop_invites SET used_at = NOW(), used_by = ${usedByUserId} WHERE id = ${invite.id}`
+  return { shopId: invite.shop_id }
 }
