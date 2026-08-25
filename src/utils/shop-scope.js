@@ -26,6 +26,28 @@ export async function assertShopOwnedByAdmin(fastify, sql, adminId, shopId) {
   return shop
 }
 
+// Throws 403 (via fastify.httpErrors) unless `cashier` is visible to
+// `adminId`. Mirrors the visibility rule used in GET /api/users: a cashier
+// is visible if their current shop_id belongs to this admin, OR — for a
+// cashier orphaned by a deleted shop (shop_id IS NULL, set via
+// ON DELETE SET NULL) — if this admin's activity_logs show they're the one
+// who originally created that cashier account. `cashier` must be an object
+// with at least { id, shop_id } (e.g. a row already fetched by the caller).
+export async function assertCashierVisibleToAdmin(fastify, sql, adminId, cashier) {
+  if (cashier.shop_id) {
+    const shopIds = await getOwnedShopIds(sql, adminId)
+    if (shopIds.includes(cashier.shop_id)) return cashier
+  } else {
+    const [log] = await sql`
+      SELECT 1 FROM activity_logs
+      WHERE entity = 'user' AND entity_id = ${cashier.id}
+        AND action = 'user_created' AND user_id = ${adminId}
+    `
+    if (log) return cashier
+  }
+  throw fastify.httpErrors.forbidden('That cashier does not belong to your account')
+}
+
 // Resolves the requesting user's authorized shop scope.
 //   - cashier -> the single shop they're assigned to (from the JWT)
 //   - admin   -> every shop they own
